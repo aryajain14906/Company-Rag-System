@@ -1,0 +1,4 @@
+﻿venv/
+__pycache__/
+*.pyc
+policies/_embeddings_cache.pkl

@@ -1,0 +1,1132 @@
+"""
+Company Policy RAG Engine (multi-file) — server-ready version
+================================================================
+Same retrieval/answering logic as the original CLI script, restructured
+so it can be used by a web server with multiple concurrent users:
+
+  - RagEngine: everything that's expensive and shared (parsed chunks,
+    embeddings, BM25 indexes, models, persona name). Built ONCE at
+    server startup, reused for every request.
+
+  - SessionState: everything that's per-conversation (history, last
+    section asked). One instance per user/session_id, created fresh
+    by the caller (see api.py) instead of living in module globals.
+    This is what makes concurrent users safe — two people's follow-up
+    questions can no longer bleed into each other the way they would
+    with module-level globals.
+
+  - engine.answer(question, session) replaces the old CLI while-loop
+    body. Same routing / rewrite / retrieval / verification pipeline,
+    just reading and writing `session` instead of module globals.
+
+LLM BACKEND: OpenRouter instead of local Ollama, so this doesn't
+require every laptop to run its own model server. Only the server
+process needs OPENROUTER_API_KEY set — clients just hit the HTTP API.
+"""
+
+import os
+import re
+import json
+import glob
+import pickle
+import hashlib
+from dataclasses import dataclass, field
+from collections import Counter
+
+import numpy as np
+import requests
+
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer, CrossEncoder, util
+from unstructured.partition.pdf import partition_pdf
+
+# ─────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────
+
+EMBED_MODEL_NAME  = "BAAI/bge-small-en-v1.5"
+RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+# OpenRouter model string. Swap for whatever you want to use —
+# see https://openrouter.ai/models for options.
+#
+# SAFETY DEFAULT: this defaults to a ":free" model, so forgetting to set
+# OPENROUTER_MODEL can never silently start billing you. If you want a
+# paid model, you must set OPENROUTER_MODEL explicitly yourself — that
+# is an intentional choice, not an accident.
+LLM_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen3-next-80b-a3b-instruct:free")
+
+if not os.getenv("OPENROUTER_MODEL"):
+    print(
+        f"[policy_rag] OPENROUTER_MODEL not set — defaulting to free model "
+        f"'{LLM_MODEL}'. Set OPENROUTER_MODEL explicitly if you want a "
+        f"different (possibly paid) model."
+    )
+elif ":free" not in LLM_MODEL:
+    print(
+        f"[policy_rag] WARNING: OPENROUTER_MODEL='{LLM_MODEL}' does NOT "
+        f"look like a free model (no ':free' suffix). This will incur "
+        f"OpenRouter charges."
+    )
+
+MAX_CHARS         = 400
+OVERLAP_ELEMENTS  = 2
+TOP_K_RETRIEVAL   = 10
+TOP_K_FINAL       = 5
+THRESHOLD         = 0.1
+DENSE_ONLY_FLOOR  = 0.55
+MAX_HISTORY       = 5
+MAX_SUBQUERIES    = 2
+SOFT_SECTION_BOOST = 0.15
+DEFAULT_ASSISTANT_NAME = "Company HR Assistant"
+MAX_SECTION_CONTEXT_CHARS = 6000
+CHUNKING_VERSION  = 4
+
+# ─────────────────────────────────────────────────────────────
+# OPENROUTER REST CLIENT
+# ─────────────────────────────────────────────────────────────
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def ask_llm(prompt: str, _retries: int = 2) -> str:
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not set. Export it on the server before "
+            "starting the app, e.g.: export OPENROUTER_API_KEY=sk-or-..."
+        )
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "http://localhost"),
+        "X-Title": os.getenv("OPENROUTER_APP_NAME", "Company Policy Assistant"),
+    }
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    last_error = None
+    for attempt in range(_retries + 1):
+        response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+
+        if "error" in data:
+            last_error = data["error"]
+            print(f"[ask_llm] OpenRouter error (attempt {attempt + 1}): {last_error}")
+            continue
+
+        choices = data.get("choices") or []
+        if not choices:
+            last_error = f"empty 'choices' in response: {data}"
+            print(f"[ask_llm] {last_error} (attempt {attempt + 1})")
+            continue
+
+        content = choices[0].get("message", {}).get("content")
+        if content is None or (isinstance(content, str) and not content.strip()):
+            last_error = f"null/empty content in response: {data}"
+            print(f"[ask_llm] {last_error} (attempt {attempt + 1})")
+            continue
+
+        return content
+
+    raise RuntimeError(
+        f"OpenRouter returned no usable content after {_retries + 1} attempts "
+        f"(model={LLM_MODEL}). Last issue: {last_error}. "
+        f"Try a different OPENROUTER_MODEL — some free models return empty "
+        f"content under load or for strict-JSON prompts."
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# 1. FOLDER INGESTION  (one section per file, via filename)
+# ─────────────────────────────────────────────────────────────
+
+def filename_to_section(pdf_path: str) -> str:
+    stem = os.path.splitext(os.path.basename(pdf_path))[0]
+    stem = re.sub(r'[_\-]+', ' ', stem).strip()
+    return stem.title() if stem else "General"
+
+
+def find_policy_pdfs(folder_path: str) -> list[str]:
+    pdfs = sorted(glob.glob(os.path.join(folder_path, "*.pdf")) +
+                  glob.glob(os.path.join(folder_path, "*.PDF")))
+    seen, unique = set(), []
+    for p in pdfs:
+        key = os.path.normcase(os.path.abspath(p))
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+    return unique
+
+
+def extract_elements(pdf_path: str) -> list:
+    return [el for el in partition_pdf(filename=pdf_path) if str(el).strip()]
+
+
+# ─────────────────────────────────────────────────────────────
+# 2. CHUNKING
+# ─────────────────────────────────────────────────────────────
+
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
+
+
+def _split_long_element(text: str, max_chars: int) -> list[str]:
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    pieces, current, current_len = [], [], 0
+    for s in sentences:
+        if current and current_len + len(s) > max_chars:
+            pieces.append(" ".join(current))
+            current, current_len = [], 0
+        current.append(s)
+        current_len += len(s)
+    if current:
+        pieces.append(" ".join(current))
+    return pieces or [text]
+
+
+def chunk_file(elements: list, section: str, max_chars: int = MAX_CHARS,
+              overlap: int = OVERLAP_ELEMENTS) -> list[dict]:
+    chunks: list[dict] = []
+    current: list[str] = []
+    current_len = 0
+    current_subsection = None
+
+    def flush():
+        nonlocal current, current_len
+        if current:
+            chunks.append({
+                "text": " ".join(current),
+                "section": section,
+                "subsection": current_subsection
+            })
+            current = current[-overlap:] if overlap else []
+            current_len = sum(len(c) for c in current)
+
+    for el in elements:
+        text = str(el).strip()
+        if not text:
+            continue
+
+        category = getattr(el, "category", None)
+        if category == "Title":
+            flush()
+            current_subsection = text
+            current.append(text)
+            current_len += len(text)
+            continue
+
+        pieces = (
+            [text] if len(text) <= max_chars
+            else _split_long_element(text, max_chars)
+        )
+
+        for piece in pieces:
+            if current and current_len + len(piece) > max_chars:
+                flush()
+            current.append(piece)
+            current_len += len(piece)
+
+    flush()
+    return chunks
+
+
+def build_all_chunks(folder_path: str) -> list[dict]:
+    pdf_paths = find_policy_pdfs(folder_path)
+    if not pdf_paths:
+        raise FileNotFoundError(f"No PDF files found in {folder_path}")
+
+    all_chunks = []
+    for pdf_path in pdf_paths:
+        section = filename_to_section(pdf_path)
+        elements = extract_elements(pdf_path)
+        all_chunks.extend(chunk_file(elements, section))
+    return all_chunks
+
+
+# ─────────────────────────────────────────────────────────────
+# 3. EMBEDDINGS
+# ─────────────────────────────────────────────────────────────
+
+def _folder_signature(folder_path: str) -> str:
+    pdf_paths = find_policy_pdfs(folder_path)
+    parts = []
+    for p in pdf_paths:
+        stat = os.stat(p)
+        parts.append(f"{os.path.basename(p)}:{stat.st_mtime_ns}:{stat.st_size}")
+    return hashlib.sha256("|".join(sorted(parts)).encode()).hexdigest()
+
+
+def load_or_create_embeddings(chunks: list[dict],
+                               embed_model: SentenceTransformer,
+                               cache_path: str,
+                               folder_signature: str) -> list[dict]:
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            cached = pickle.load(f)
+
+        valid = (
+            isinstance(cached, dict)
+            and cached.get("version") == CHUNKING_VERSION
+            and cached.get("signature") == folder_signature
+            and cached.get("chunks") is not None
+        )
+        if valid:
+            return cached["chunks"]
+
+    for chunk in chunks:
+        chunk["embedding"] = embed_model.encode(chunk["text"], convert_to_tensor=False)
+    with open(cache_path, "wb") as f:
+        pickle.dump({
+            "version": CHUNKING_VERSION,
+            "signature": folder_signature,
+            "chunks": chunks
+        }, f)
+    return chunks
+
+
+# ─────────────────────────────────────────────────────────────
+# 4. SECTION SHORT-CIRCUIT
+# ─────────────────────────────────────────────────────────────
+
+def _merge_overlapping_texts(texts: list[str]) -> str:
+    merged = ""
+    for text in texts:
+        if not merged:
+            merged = text
+            continue
+        merged_words = merged.split()
+        text_words = text.split()
+        max_overlap = min(len(merged_words), len(text_words))
+        overlap_len = 0
+        for k in range(max_overlap, 0, -1):
+            if merged_words[-k:] == text_words[:k]:
+                overlap_len = k
+                break
+        remainder = " ".join(text_words[overlap_len:])
+        merged = f"{merged} {remainder}".strip() if remainder else merged
+    return merged
+
+
+def batch_section_contexts(section: str, chunks: list[dict],
+                            max_chars: int = MAX_SECTION_CONTEXT_CHARS) -> list[str]:
+    section_chunks = [c for c in chunks if c.get("section") == section]
+    if not section_chunks:
+        return [f"[Section: {section}]\n(no content found)"]
+
+    batches: list[list[str]] = [[]]
+    batch_len = 0
+    for c in section_chunks:
+        text = c["text"]
+        if batches[-1] and batch_len + len(text) > max_chars:
+            batches.append([])
+            batch_len = 0
+        batches[-1].append(text)
+        batch_len += len(text)
+
+    return [
+        f"[Section: {section} — part {i} of {len(batches)}]\n{_merge_overlapping_texts(batch)}"
+        for i, batch in enumerate(batches, start=1)
+    ]
+
+
+# ─────────────────────────────────────────────────────────────
+# 4b. HYBRID RETRIEVAL
+# ─────────────────────────────────────────────────────────────
+
+def build_bm25(chunks: list[dict]) -> BM25Okapi:
+    tokenised = [chunk["text"].lower().split() for chunk in chunks]
+    return BM25Okapi(tokenised)
+
+
+def build_embedding_matrix(chunks: list[dict]) -> np.ndarray:
+    return np.array([chunk["embedding"] for chunk in chunks], dtype=np.float32)
+
+
+def build_section_indexes(chunks: list[dict]) -> dict[str, dict]:
+    by_section: dict[str, list[dict]] = {}
+    for c in chunks:
+        by_section.setdefault(c.get("section"), []).append(c)
+
+    indexes: dict[str, dict] = {}
+    for section, section_chunks in by_section.items():
+        indexes[section] = {
+            "chunks": section_chunks,
+            "bm25": build_bm25(section_chunks),
+            "matrix": build_embedding_matrix(section_chunks),
+        }
+    return indexes
+
+
+def hybrid_retrieve(query: str,
+                    chunks: list[dict],
+                    bm25: BM25Okapi,
+                    embed_model: SentenceTransformer,
+                    embedding_matrix: np.ndarray,
+                    section_hint: str | None,
+                    top_k: int = TOP_K_RETRIEVAL) -> list[dict]:
+    q_emb      = embed_model.encode(query, convert_to_tensor=True)
+    cos_scores = util.cos_sim(q_emb, embedding_matrix)[0].tolist()
+
+    all_bm25  = bm25.get_scores(query.lower().split())
+    bm25_max  = max(all_bm25) or 1.0
+    bm25_norm = [s / bm25_max for s in all_bm25]
+
+    results = []
+    for i, chunk in enumerate(chunks):
+        if bm25_norm[i] == 0.0 and cos_scores[i] < DENSE_ONLY_FLOOR:
+            continue
+
+        hybrid_score = 0.5 * cos_scores[i] + 0.5 * bm25_norm[i]
+        if section_hint and chunk.get("section") == section_hint:
+            hybrid_score += SOFT_SECTION_BOOST
+        results.append({"score": hybrid_score, "chunk": chunk})
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:top_k]
+
+
+def multi_query_retrieve(queries: list[str],
+                         chunks: list[dict],
+                         bm25: BM25Okapi,
+                         embed_model: SentenceTransformer,
+                         embedding_matrix: np.ndarray,
+                         section_hint: str | None,
+                         top_k: int = TOP_K_RETRIEVAL) -> list[dict]:
+    best_by_text: dict[str, dict] = {}
+    for q in queries:
+        if not q.strip():
+            continue
+        candidates = hybrid_retrieve(
+            q, chunks, bm25, embed_model, embedding_matrix, section_hint, top_k=top_k
+        )
+        for c in candidates:
+            text = c["chunk"]["text"]
+            if text not in best_by_text or c["score"] > best_by_text[text]["score"]:
+                best_by_text[text] = c
+
+    merged = list(best_by_text.values())
+    merged.sort(key=lambda x: x["score"], reverse=True)
+    return merged[:top_k]
+
+
+# ─────────────────────────────────────────────────────────────
+# 5. RERANKER
+# ─────────────────────────────────────────────────────────────
+
+def rerank(query: str, candidates: list[dict], reranker: CrossEncoder,
+          top_k: int = TOP_K_FINAL) -> list[dict]:
+    pairs  = [(query, c["chunk"]["text"]) for c in candidates]
+    scores = reranker.predict(pairs)
+    for i, c in enumerate(candidates):
+        c["rerank_score"] = float(scores[i])
+    candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
+    return candidates[:top_k]
+
+
+# ─────────────────────────────────────────────────────────────
+# 6. LLM ROUTER
+# ─────────────────────────────────────────────────────────────
+
+ROUTER_PROMPT = """
+You are a routing classifier for a company policy chatbot assistant.
+
+Classify the user's message into exactly one of two categories:
+
+greeting
+  - Greetings, farewells, thanks, casual small talk, or any non-factual
+    conversational message.
+  - Includes ANY message that is clearly meant as a greeting or casual
+    opener, even if it contains a typo or misspelling.
+  - If a short message (1-4 words) looks like it could be a greeting
+    attempt, classify it as greeting.
+  - Examples: hi, hello, hey, hii, wello, helo, heyyy, show are you,
+    how are you, how r u, hw are you, good morning, gm, thanks, ty,
+    thank you, nice to meet you, bye, cya, who are you, sup, wassup.
+
+policy
+  - Any clear question or request about company policy, HR, benefits,
+    leave, conduct, insurance, or any related topic.
+  - GENERAL RULE (not a fixed phrase list): any message that seeks a
+    judgment, evaluation, recommendation, comparison, opinion, pro/con,
+    or "should I..." verdict about the company, its policies, the job,
+    or working there — in EITHER direction — is policy, never greeting.
+  - This matters because only the policy path has a rule to say
+    "I can't say — the policy documents don't state an opinion on
+    that." The greeting path has no such rule.
+  - If genuinely torn between greeting and this category, default to
+    policy.
+
+When in doubt about a short, purely casual message with no evaluative
+content → greeting.
+When in doubt about a factual question, OR any opinion/evaluation/
+recommendation request about the company or job → policy.
+
+Respond with exactly one word: greeting  OR  policy.
+
+Question: {query}
+"""
+
+
+def route_query(query: str) -> str:
+    prompt = ROUTER_PROMPT.format(query=query)
+    answer = ask_llm(prompt).strip().lower()
+    return "greeting" if "greeting" in answer else "policy"
+
+
+# ─────────────────────────────────────────────────────────────
+# 6b. COMBINED REWRITE + EXPAND + SECTION/SCOPE CLASSIFICATION
+# ─────────────────────────────────────────────────────────────
+
+REWRITE_EXPAND_CLASSIFY_PROMPT = """
+You are a query understanding assistant for a company policy chatbot
+with multiple policy documents, one section per document.
+
+Available sections in this company's policy documents:
+{sections}
+
+Conversation History:
+{history}
+
+Latest Question:
+{query}
+
+Do FOUR things:
+
+1. Rewrite the latest question into a fully standalone question.
+   Resolve pronouns and follow-ups using history. Never narrow scope.
+   Keep any format instructions unchanged.
+
+2. Generate up to {max_paraphrases} alternative phrasing(s) of the
+   standalone question for search purposes.
+
+3. Decide which ONE section this question is primarily about (exact
+   name from the list, or null if general/multi-section).
+
+4. If you picked a section, classify scope as "broad" (procedural/full
+   explanation), "aggregate" (complete list of every distinct item,
+   condensed), or "narrow" (one specific already-named item/fact).
+   DEFAULT: if no specific type is named, use "aggregate", never
+   "narrow".
+
+Respond with ONLY valid JSON, no markdown fences, no preamble:
+
+{{
+  "standalone_question": "...",
+  "paraphrases": ["...", "..."],
+  "section": "<exact section name from the list, or null>",
+  "scope": "<broad, aggregate, narrow, or null>"
+}}
+"""
+
+
+def rewrite_expand_and_classify(query: str, available_sections: list[str],
+                                 history_text: str) -> dict:
+    section_lookup = {s.lower(): s for s in available_sections}
+    prompt = REWRITE_EXPAND_CLASSIFY_PROMPT.format(
+        sections="\n".join(f"- {s}" for s in available_sections) or "(none)",
+        history=history_text,
+        query=query,
+        max_paraphrases=max(MAX_SUBQUERIES - 1, 0)
+    )
+    raw = ask_llm(prompt)
+    cleaned = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+
+    fallback = {
+        "standalone_question": query,
+        "paraphrases": [],
+        "section": None,
+        "scope": None
+    }
+
+    try:
+        parsed = json.loads(cleaned)
+    except (json.JSONDecodeError, AttributeError):
+        return fallback
+
+    standalone = parsed.get("standalone_question")
+    standalone = standalone.strip() if isinstance(standalone, str) and standalone.strip() else query
+
+    paraphrases_raw = parsed.get("paraphrases", [])
+    paraphrases = (
+        [p.strip() for p in paraphrases_raw if isinstance(p, str) and p.strip()]
+        if isinstance(paraphrases_raw, list) else []
+    )
+    paraphrases = paraphrases[:max(MAX_SUBQUERIES - 1, 0)]
+
+    section = None
+    if available_sections:
+        section_raw = parsed.get("section")
+        section = (
+            section_lookup.get(section_raw.strip().lower())
+            if isinstance(section_raw, str) else None
+        )
+
+    scope = None
+    if section is not None:
+        scope_raw = parsed.get("scope")
+        scope = scope_raw.strip().lower() if isinstance(scope_raw, str) else None
+        if scope not in ("broad", "aggregate", "narrow"):
+            scope = "broad"
+
+    return {
+        "standalone_question": standalone,
+        "paraphrases": paraphrases,
+        "section": section,
+        "scope": scope
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# 6c. STANDALONE SECTION CLASSIFICATION (soft hint)
+# ─────────────────────────────────────────────────────────────
+
+SECTION_SCOPE_PROMPT = """
+You are a query classifier for a company policy chatbot with multiple
+policy documents, one section per document.
+
+Available sections in this company's policy documents:
+{sections}
+
+Question:
+{query}
+
+Decide which ONE section this question is primarily about (exact name
+from the list, or null if it doesn't clearly belong to one section).
+
+Respond with ONLY valid JSON, no markdown fences, no preamble:
+
+{{
+  "section": "<exact section name from the list, or null>"
+}}
+"""
+
+
+def soft_section_hint(query: str, available_sections: list[str] | None = None) -> str | None:
+    if not available_sections:
+        return None
+
+    section_lookup = {s.lower(): s for s in available_sections}
+    prompt = SECTION_SCOPE_PROMPT.format(
+        sections="\n".join(f"- {s}" for s in available_sections),
+        query=query
+    )
+    raw = ask_llm(prompt)
+    cleaned = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+
+    try:
+        parsed = json.loads(cleaned)
+    except (json.JSONDecodeError, AttributeError):
+        return None
+
+    section_raw = parsed.get("section")
+    if isinstance(section_raw, str):
+        return section_lookup.get(section_raw.strip().lower())
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
+# 7. PER-SESSION CONVERSATION STATE
+# ─────────────────────────────────────────────────────────────
+
+_MORE_FOLLOWUP_RE = re.compile(
+    r'\b(any\s*more|anything\s*else|any\s*other|what\s*else|else\??$|'
+    r'more\s+(leaves?|benefits?|rules?|policies)|besides\s+that|'
+    r'other\s+than\s+that)\b',
+    re.IGNORECASE
+)
+
+
+def is_more_followup(query: str) -> bool:
+    return bool(_MORE_FOLLOWUP_RE.search(query.strip()))
+
+
+@dataclass
+class SessionState:
+    """
+    Per-conversation state. One instance per session_id, kept by the
+    caller (e.g. api.py's SESSIONS dict) — never shared across users.
+    This replaces the old module-level `conversation_history` /
+    `last_section_asked` globals from the CLI version.
+    """
+    conversation_history: list[dict] = field(default_factory=list)
+    last_section_asked: str | None = None
+
+    def build_history_text(self) -> str:
+        if not self.conversation_history:
+            return "No previous conversation."
+        history = ""
+        for turn in self.conversation_history:
+            history += f"User: {turn['user']}\n"
+            history += f"Assistant: {turn['assistant']}\n\n"
+        return history
+
+    def save_turn(self, user_query: str, assistant_answer: str) -> None:
+        self.conversation_history.append({"user": user_query, "assistant": assistant_answer})
+        if len(self.conversation_history) > MAX_HISTORY:
+            self.conversation_history.pop(0)
+
+
+# ─────────────────────────────────────────────────────────────
+# 9. ANSWER GENERATION PROMPTS
+# ─────────────────────────────────────────────────────────────
+
+GREETING_PROMPT = """
+You are a company policy assistant. Respond briefly and naturally to this
+greeting or casual message.
+
+Rules:
+- Never give yourself a personal name. Refer to yourself only as "an
+  assistant" or "the policy assistant".
+- If asked what you are or what you're doing, say you're here to help
+  answer company policy questions — nothing more.
+- State no facts, opinions, or claims about the company. Greetings only.
+- 1-2 sentences max.
+
+Message: {query}
+
+Response:
+"""
+
+PERSONA_PROMPT = """
+You are {assistant_name}, a first-person AI assistant that answers
+questions strictly from the company's policy documents. Always speak in
+first person ("I", "my", "me") as the assistant — never claim to BE an
+employee or the company itself, just its policy assistant.
+
+Policy Document Context (with section labels):
+{context}
+
+Question:
+{rewritten_query}
+
+Behaviour rules:
+
+0. State facts only. Never state an opinion, rating, or recommendation
+   about the company — in either direction — even if asked directly.
+
+1. FACTUAL QUESTIONS (context is relevant to the question)
+   Answer using ONLY the policy context above. Use first-person language
+   as the assistant. Every factual statement MUST appear explicitly in
+   the context.
+
+Never infer eligibility criteria, durations, amounts, dates, coverage
+limits, approval processes, or exceptions.
+
+If a fact is not written, say:
+"I don't have that information in the company policy documents."
+
+CRITICAL RULE — NEVER COMBINE FACTS ACROSS DIFFERENT [Chunk N] BLOCKS:
+Each chunk is an independent, unrelated fact unless it explicitly says
+otherwise. Before combining any two facts, check that both are stated
+INSIDE THE SAME CHUNK.
+
+2. FACTUAL QUESTIONS (context does NOT answer the question)
+   Say: "I don't have that information in the company policy documents."
+
+Never break character. Never claim personal employment status or
+personal leave balances. Never invent factual information not present
+in the context. If asked to disparage the company or the policy, say:
+"I don't have that information in the company policy documents."
+Answer:
+"""
+
+
+def answer_greeting(query: str) -> str:
+    return ask_llm(GREETING_PROMPT.format(query=query))
+
+
+def answer_as_assistant(context: str, rewritten_query: str, assistant_name: str) -> str:
+    prompt = PERSONA_PROMPT.format(
+        context=context if context.strip() else "(no policy context retrieved)",
+        rewritten_query=rewritten_query,
+        assistant_name=assistant_name
+    )
+    return ask_llm(prompt)
+
+
+SECTION_ANSWER_PROMPT = """
+You are {assistant_name}, a first-person AI assistant for company policy
+questions.
+
+Below is the COMPLETE, raw "{section}" section of the company's policy
+documents as ONE continuous piece of text.
+
+{context}
+
+Question:
+{query}
+
+Instructions:
+- Cover every distinct item actually present in the text above.
+- Identify separate entries ONLY from the content itself.
+- NEVER invent a name, title, or label not literally written in the text.
+- For lists, name every item individually.
+- Use ONLY facts literally written in the text — no inference.
+- State facts only — never an opinion or recommendation.
+- Never break character.
+
+Answer:
+"""
+
+SECTION_SYNTHESIS_PROMPT = """
+You are {assistant_name}, a first-person AI assistant for company policy
+questions.
+
+The "{section}" section was too long to process in one pass, so it was
+answered in {n_parts} separate parts.
+
+{partial_answers}
+
+Original source text for each part:
+{source_parts}
+
+Question:
+{query}
+
+Combine the partial answers into ONE final, coherent answer, including
+every distinct item across all parts (mention duplicates once). Never
+invent new figures. Prefer source text over a partial answer if they
+disagree. Never break character.
+
+Final Answer:
+"""
+
+
+def answer_section_as_assistant(section_label: str, contexts: list[str], query: str,
+                                 assistant_name: str) -> str:
+    if len(contexts) == 1:
+        prompt = SECTION_ANSWER_PROMPT.format(
+            section=section_label, context=contexts[0], query=query,
+            assistant_name=assistant_name
+        )
+        return ask_llm(prompt)
+
+    partial_answers = []
+    for ctx in contexts:
+        prompt = SECTION_ANSWER_PROMPT.format(
+            section=section_label, context=ctx, query=query,
+            assistant_name=assistant_name
+        )
+        partial_answers.append(ask_llm(prompt))
+
+    joined_partials = "\n\n".join(
+        f"[Part {i}]\n{ans}" for i, ans in enumerate(partial_answers, start=1)
+    )
+    joined_sources = "\n\n".join(
+        f"[Part {i} source]\n{ctx}" for i, ctx in enumerate(contexts, start=1)
+    )
+    synthesis_prompt = SECTION_SYNTHESIS_PROMPT.format(
+        section=section_label,
+        n_parts=len(contexts),
+        partial_answers=joined_partials,
+        source_parts=joined_sources,
+        query=query,
+        assistant_name=assistant_name
+    )
+    return ask_llm(synthesis_prompt)
+
+
+SECTION_AGGREGATE_PROMPT = """
+You are {assistant_name}, a first-person AI assistant for company policy
+questions.
+
+Below is the COMPLETE, raw "{section}" section of the company's policy
+documents as ONE continuous piece of text.
+
+{context}
+
+Question:
+{query}
+
+The user wants a CONCISE but COMPLETE answer: every distinct
+entitlement/type in this section, with its headline amount, nothing else.
+
+Instructions:
+- Name every distinct type present, each with its amount, concisely.
+- Do NOT include procedural detail unless explicitly asked.
+- Honor short-format requests without dropping entitlement types.
+- If an amount varies by an unspecified criterion, name every variant.
+- If the question specifies a qualifying detail, use the matching
+  variant for that entitlement but still name every other type in full.
+- Use ONLY facts literally written in the text.
+- State facts only — never an opinion or recommendation.
+- Never break character.
+
+Answer:
+"""
+
+SECTION_AGGREGATE_SYNTHESIS_PROMPT = """
+You are {assistant_name}, a first-person AI assistant for company policy
+questions.
+
+The "{section}" section was too long to process in one pass, so it was
+answered in {n_parts} separate condensed parts.
+
+{partial_answers}
+
+Original source text for each part:
+{source_parts}
+
+Question:
+{query}
+
+Combine into ONE final, CONCISE answer covering every distinct
+entitlement type (mention duplicates once). No procedural detail unless
+asked. Never invent new figures — prefer source text if partials
+disagree. Never break character.
+
+Final Answer:
+"""
+
+
+def answer_section_aggregate(section_label: str, contexts: list[str], query: str,
+                              assistant_name: str) -> str:
+    if len(contexts) == 1:
+        prompt = SECTION_AGGREGATE_PROMPT.format(
+            section=section_label, context=contexts[0], query=query,
+            assistant_name=assistant_name
+        )
+        return ask_llm(prompt)
+
+    partial_answers = []
+    for ctx in contexts:
+        prompt = SECTION_AGGREGATE_PROMPT.format(
+            section=section_label, context=ctx, query=query,
+            assistant_name=assistant_name
+        )
+        partial_answers.append(ask_llm(prompt))
+
+    joined_partials = "\n\n".join(
+        f"[Part {i}]\n{ans}" for i, ans in enumerate(partial_answers, start=1)
+    )
+    joined_sources = "\n\n".join(
+        f"[Part {i} source]\n{ctx}" for i, ctx in enumerate(contexts, start=1)
+    )
+    synthesis_prompt = SECTION_AGGREGATE_SYNTHESIS_PROMPT.format(
+        section=section_label,
+        n_parts=len(contexts),
+        partial_answers=joined_partials,
+        source_parts=joined_sources,
+        query=query,
+        assistant_name=assistant_name
+    )
+    return ask_llm(synthesis_prompt)
+
+
+# ─────────────────────────────────────────────────────────────
+# 10. ANSWER VERIFICATION
+# ─────────────────────────────────────────────────────────────
+
+VERIFY_PROMPT = """
+You are a strict fact-checker for a company policy chatbot assistant.
+
+Policy Document Context:
+{context}
+
+Question that was asked:
+{question}
+
+Answer to verify:
+{answer}
+
+Rules:
+- If the context does not contain information relevant to the question,
+  output exactly: "I don't have that information in the company policy
+  documents."
+- If the answer uses context about a different topic than what was
+  asked, output exactly the same message.
+- Chunks from different sections/files are unrelated unless one
+  explicitly states the connection — delete any claim that combines them.
+- Remove any subjective claims / opinions / recommendations about the
+  company. If that leaves the question unanswered, output:
+  "I can't say — the policy documents don't state an opinion on that."
+- Never merge facts from different chunks unless the context states the
+  connection. No inference, no invented numbers/names/dates.
+- Otherwise rewrite the answer so every claim is grounded in the context.
+  Keep first-person assistant language.
+
+Output ONLY the final corrected answer. No preamble.
+
+Corrected Answer:
+"""
+
+
+def verify_answer(context: str, answer: str, question: str = "") -> str:
+    prompt = VERIFY_PROMPT.format(context=context, answer=answer, question=question)
+    return ask_llm(prompt).strip()
+
+
+# ─────────────────────────────────────────────────────────────
+# 11. COMPANY NAME EXTRACTION
+# ─────────────────────────────────────────────────────────────
+
+_COMPANY_NAME_PROMPT = """
+Below are the first few lines extracted from one of a company's policy
+documents.
+
+Text:
+{text}
+
+Identify the company name if it is clearly stated in this text. Respond
+with ONLY the company name, nothing else. If not identifiable, respond
+with exactly: UNKNOWN
+
+Company name:
+"""
+
+
+def guess_company_name(all_chunks: list[dict]) -> str | None:
+    seen_sections = set()
+    for chunk in all_chunks:
+        section = chunk.get("section")
+        if section in seen_sections:
+            continue
+        seen_sections.add(section)
+        try:
+            raw = ask_llm(_COMPANY_NAME_PROMPT.format(text=chunk["text"][:500])).strip()
+        except requests.RequestException:
+            continue
+        raw = raw.strip().strip('"').strip()
+        if raw and raw.upper() != "UNKNOWN" and len(raw.split()) <= 6:
+            return raw
+    return None
+
+
+def build_assistant_name(company_name: str | None) -> str:
+    return f"{company_name} HR Assistant" if company_name else DEFAULT_ASSISTANT_NAME
+
+
+# ─────────────────────────────────────────────────────────────
+# 12. RAG ENGINE  (built once at server startup, shared/read-only
+#     across all requests; per-session mutable state lives in
+#     SessionState instead)
+# ─────────────────────────────────────────────────────────────
+
+class RagEngine:
+    def __init__(self, folder_path: str, verbose: bool = True):
+        if not os.path.isdir(folder_path):
+            raise FileNotFoundError(f"Folder not found: {folder_path}")
+
+        self.folder_path = folder_path
+        self.verbose = verbose
+        cache_path = os.path.join(folder_path, "_embeddings_cache.pkl")
+
+        self._log("Scanning folder and parsing PDFs...")
+        chunks = build_all_chunks(folder_path)
+        self._log(f"Created {len(chunks)} chunks across all files.")
+
+        section_counts = Counter(c["section"] for c in chunks)
+        self._log(f"Section distribution: {dict(section_counts)}")
+        self.available_sections = sorted(section_counts.keys())
+
+        company_name = guess_company_name(chunks)
+        self.assistant_name = build_assistant_name(company_name)
+        self._log(f"Assistant persona: {self.assistant_name}")
+
+        self._log("Loading embedding model...")
+        self.embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+
+        self._log("Loading reranker...")
+        self.reranker = CrossEncoder(RERANK_MODEL_NAME)
+
+        folder_signature = _folder_signature(folder_path)
+        self.chunks = load_or_create_embeddings(chunks, self.embed_model, cache_path, folder_signature)
+
+        self.bm25 = build_bm25(self.chunks)
+        self.embedding_matrix = build_embedding_matrix(self.chunks)
+        self.section_indexes = build_section_indexes(self.chunks)
+
+        self._log("Engine ready.")
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(msg)
+
+    def answer(self, query: str, session: "SessionState") -> str:
+        query = query.strip()
+        intent = route_query(query)
+
+        if intent == "greeting":
+            answer = answer_greeting(query)
+            session.save_turn(query, answer)
+            return answer
+
+        understanding = rewrite_expand_and_classify(
+            query, self.available_sections, session.build_history_text()
+        )
+        standalone_query = understanding["standalone_question"]
+        paraphrases = understanding["paraphrases"]
+        target_section = understanding["section"]
+        section_scope = understanding["scope"]
+        all_queries = [standalone_query] + paraphrases
+
+        context = ""
+        section_contexts: list[str] = []
+
+        if target_section and section_scope in ("broad", "aggregate"):
+            section_contexts = batch_section_contexts(target_section, self.chunks)
+
+            if target_section == session.last_section_asked and is_more_followup(query):
+                label = "details" if section_scope == "broad" else "entitlements"
+                answer = (
+                    f"Those are all the {target_section.lower()} {label} I have — "
+                    f"I don't have anything else listed in the company policy "
+                    f"documents beyond what I already mentioned."
+                )
+                session.save_turn(query, answer)
+                return answer
+
+            session.last_section_asked = target_section
+
+        elif target_section and section_scope == "narrow":
+            session.last_section_asked = None
+            section_index = self.section_indexes.get(target_section)
+            candidates = (
+                multi_query_retrieve(
+                    all_queries, section_index["chunks"], section_index["bm25"],
+                    self.embed_model, section_index["matrix"], section_hint=None
+                ) if section_index else []
+            )
+            if candidates and candidates[0]["score"] >= THRESHOLD:
+                top = rerank(standalone_query, candidates, self.reranker)
+                context = "\n\n".join(
+                    f"[Chunk {i} — Section: {r['chunk'].get('section')}]\n{r['chunk']['text']}"
+                    for i, r in enumerate(top, start=1)
+                )
+
+        else:
+            session.last_section_asked = None
+            section_hint = soft_section_hint(standalone_query, self.available_sections)
+
+            candidates = multi_query_retrieve(
+                all_queries, self.chunks, self.bm25, self.embed_model,
+                self.embedding_matrix, section_hint
+            )
+            if candidates and candidates[0]["score"] >= THRESHOLD:
+                top = rerank(standalone_query, candidates, self.reranker)
+                context = "\n\n".join(
+                    f"[Chunk {i} — Section: {r['chunk'].get('section')}]\n{r['chunk']['text']}"
+                    for i, r in enumerate(top, start=1)
+                )
+
+        if target_section and section_scope == "broad":
+            answer = answer_section_as_assistant(
+                target_section, section_contexts, standalone_query, self.assistant_name
+            )
+        elif target_section and section_scope == "aggregate":
+            answer = answer_section_aggregate(
+                target_section, section_contexts, standalone_query, self.assistant_name
+            )
+        else:
+            answer = answer_as_assistant(context, standalone_query, self.assistant_name)
+
+        used_section_dump = target_section and section_scope in ("broad", "aggregate")
+        if not used_section_dump and context:
+            answer = verify_answer(context, answer, question=standalone_query)
+
+        session.save_turn(query, answer)
+        return answer
