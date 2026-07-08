@@ -37,6 +37,7 @@ import os
 import re
 import json
 import glob
+import time
 import pickle
 import hashlib
 import statistics
@@ -122,6 +123,18 @@ def ask_llm(prompt: str, _retries: int = 2) -> str:
     last_error = None
     for attempt in range(_retries + 1):
         response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+
+        if response.status_code == 429:
+            # Rate limited — short backoff then retry, instead of
+            # immediately failing the whole answer. Free-tier
+            # OpenRouter models can hit per-minute caps easily since
+            # one user question triggers several ask_llm() calls.
+            last_error = f"429 rate limited (attempt {attempt + 1})"
+            print(f"[ask_llm] {last_error} — backing off before retry")
+            if attempt < _retries:
+                time.sleep(3 * (attempt + 1))
+            continue
+
         response.raise_for_status()
         data = response.json()
 
@@ -522,57 +535,15 @@ def rerank(query: str, candidates: list[dict], reranker: CrossEncoder,
 # 6. LLM ROUTER
 # ─────────────────────────────────────────────────────────────
 
-ROUTER_PROMPT = """
-You are a routing classifier for a company policy chatbot assistant.
-
-Classify the user's message into exactly one of two categories:
-
-greeting
-  - Greetings, farewells, thanks, casual small talk, or any non-factual
-    conversational message.
-  - Includes ANY message that is clearly meant as a greeting or casual
-    opener, even if it contains a typo or misspelling.
-  - If a short message (1-4 words) looks like it could be a greeting
-    attempt, classify it as greeting.
-  - Examples: hi, hello, hey, hii, wello, helo, heyyy, show are you,
-    how are you, how r u, hw are you, good morning, gm, thanks, ty,
-    thank you, nice to meet you, bye, cya, who are you, sup, wassup.
-
-policy
-  - Any clear question or request about company policy, HR, benefits,
-    leave, conduct, insurance, or any related topic.
-  - GENERAL RULE (not a fixed phrase list): any message that seeks a
-    judgment, evaluation, recommendation, comparison, opinion, pro/con,
-    or "should I..." verdict about the company, its policies, the job,
-    or working there — in EITHER direction — is policy, never greeting.
-  - This matters because only the policy path has a rule to say
-    "I can't say — the policy documents don't state an opinion on
-    that." The greeting path has no such rule.
-  - If genuinely torn between greeting and this category, default to
-    policy.
-
-When in doubt about a short, purely casual message with no evaluative
-content → greeting.
-When in doubt about a factual question, OR any opinion/evaluation/
-recommendation request about the company or job → policy.
-
-Respond with exactly one word: greeting  OR  policy.
-
-Question: {query}
-"""
-
-
-def route_query(query: str) -> str:
-    prompt = ROUTER_PROMPT.format(query=query)
-    answer = ask_llm(prompt).strip().lower()
-    return "greeting" if "greeting" in answer else "policy"
-
-
 # ─────────────────────────────────────────────────────────────
-# 6b. COMBINED REWRITE + EXPAND + SECTION/SCOPE CLASSIFICATION
+# 6+6b. COMBINED ROUTE + REWRITE + EXPAND + SECTION/SCOPE
+#        CLASSIFICATION — merged into ONE LLM call (was two:
+#        route_query() + rewrite_expand_and_classify()) to cut
+#        API usage roughly in half, since free-tier OpenRouter
+#        models have tight rate limits.
 # ─────────────────────────────────────────────────────────────
 
-REWRITE_EXPAND_CLASSIFY_PROMPT = """
+ROUTE_REWRITE_EXPAND_CLASSIFY_PROMPT = """
 You are a query understanding assistant for a company policy chatbot
 with multiple policy documents, one section per document.
 
@@ -582,42 +553,64 @@ Available sections in this company's policy documents:
 Conversation History:
 {history}
 
-Latest Question:
+Latest Message:
 {query}
 
 Do FOUR things:
 
-1. Rewrite the latest question into a fully standalone question.
-   Resolve pronouns and follow-ups using history. Never narrow scope.
-   Keep any format instructions unchanged.
+1. Classify the message as "greeting" or "policy":
+   greeting
+     - Greetings, farewells, thanks, casual small talk, or any
+       non-factual conversational message.
+     - Includes ANY message that is clearly meant as a greeting or
+       casual opener, even if it contains a typo or misspelling.
+     - If a short message (1-4 words) looks like it could be a
+       greeting attempt, classify it as greeting.
+     - Examples: hi, hello, hey, hii, wello, helo, heyyy, show are
+       you, how are you, how r u, hw are you, good morning, gm,
+       thanks, ty, thank you, nice to meet you, bye, cya, who are
+       you, sup, wassup.
+   policy
+     - Any clear question or request about company policy, HR,
+       benefits, leave, conduct, insurance, or any related topic.
+     - GENERAL RULE: any message that seeks a judgment, evaluation,
+       recommendation, comparison, opinion, pro/con, or "should I..."
+       verdict about the company, its policies, the job, or working
+       there — in EITHER direction — is policy, never greeting.
+     - If genuinely torn, default to policy.
 
-2. Generate up to {max_paraphrases} alternative phrasing(s) of the
+   If intent is "greeting", leave every other field below as null /
+   empty and do not attempt steps 2-4.
+
+2. If intent is "policy": rewrite the latest message into a fully
+   standalone question. Resolve pronouns and follow-ups using
+   history. Never narrow scope. Keep any format instructions
+   unchanged (e.g. if the user asked for a short/detailed/bulleted
+   answer, preserve that instruction in the rewrite).
+
+3. Generate up to {max_paraphrases} alternative phrasing(s) of the
    standalone question for search purposes.
 
-3. Decide which ONE section this question is primarily about (exact
-   name from the list, or null if general/multi-section).
-
-4. If you picked a section, classify scope as "broad" (procedural/full
-   explanation), "aggregate" (complete list of every distinct item,
-   condensed), or "narrow" (one specific already-named item/fact).
-   DEFAULT: if no specific type is named, use "aggregate", never
-   "narrow".
+4. Decide which ONE section this question is most likely about, as a
+   soft hint to help retrieval (exact name from the list, or null if
+   general/unclear/multi-section). This is just a bias, not a hard
+   routing decision, so a reasonable best guess is fine.
 
 Respond with ONLY valid JSON, no markdown fences, no preamble:
 
 {{
+  "intent": "greeting" or "policy",
   "standalone_question": "...",
   "paraphrases": ["...", "..."],
-  "section": "<exact section name from the list, or null>",
-  "scope": "<broad, aggregate, narrow, or null>"
+  "section": "<exact section name from the list, or null>"
 }}
 """
 
 
-def rewrite_expand_and_classify(query: str, available_sections: list[str],
-                                 history_text: str) -> dict:
+def route_rewrite_expand_and_classify(query: str, available_sections: list[str],
+                                       history_text: str) -> dict:
     section_lookup = {s.lower(): s for s in available_sections}
-    prompt = REWRITE_EXPAND_CLASSIFY_PROMPT.format(
+    prompt = ROUTE_REWRITE_EXPAND_CLASSIFY_PROMPT.format(
         sections="\n".join(f"- {s}" for s in available_sections) or "(none)",
         history=history_text,
         query=query,
@@ -627,16 +620,27 @@ def rewrite_expand_and_classify(query: str, available_sections: list[str],
     cleaned = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
 
     fallback = {
+        "intent": "policy",
         "standalone_question": query,
         "paraphrases": [],
-        "section": None,
-        "scope": None
+        "section": None
     }
 
     try:
         parsed = json.loads(cleaned)
     except (json.JSONDecodeError, AttributeError):
         return fallback
+
+    intent_raw = parsed.get("intent")
+    intent = "greeting" if isinstance(intent_raw, str) and "greeting" in intent_raw.lower() else "policy"
+
+    if intent == "greeting":
+        return {
+            "intent": "greeting",
+            "standalone_question": query,
+            "paraphrases": [],
+            "section": None
+        }
 
     standalone = parsed.get("standalone_question")
     standalone = standalone.strip() if isinstance(standalone, str) and standalone.strip() else query
@@ -656,18 +660,11 @@ def rewrite_expand_and_classify(query: str, available_sections: list[str],
             if isinstance(section_raw, str) else None
         )
 
-    scope = None
-    if section is not None:
-        scope_raw = parsed.get("scope")
-        scope = scope_raw.strip().lower() if isinstance(scope_raw, str) else None
-        if scope not in ("broad", "aggregate", "narrow"):
-            scope = "broad"
-
     return {
+        "intent": "policy",
         "standalone_question": standalone,
         "paraphrases": paraphrases,
-        "section": section,
-        "scope": scope
+        "section": section
     }
 
 
@@ -1055,40 +1052,12 @@ def verify_answer(context: str, answer: str, question: str = "") -> str:
 # 11. COMPANY NAME EXTRACTION
 # ─────────────────────────────────────────────────────────────
 
-_COMPANY_NAME_PROMPT = """
-Below are the first few lines extracted from one of a company's policy
-documents.
-
-Text:
-{text}
-
-Identify the company name if it is clearly stated in this text. Respond
-with ONLY the company name, nothing else. If not identifiable, respond
-with exactly: UNKNOWN
-
-Company name:
-"""
+# (company-name extraction removed — always uses DEFAULT_ASSISTANT_NAME
+# now, saving one LLM call per unique section at startup)
 
 
-def guess_company_name(all_chunks: list[dict]) -> str | None:
-    seen_sections = set()
-    for chunk in all_chunks:
-        section = chunk.get("section")
-        if section in seen_sections:
-            continue
-        seen_sections.add(section)
-        try:
-            raw = ask_llm(_COMPANY_NAME_PROMPT.format(text=chunk["text"][:500])).strip()
-        except requests.RequestException:
-            continue
-        raw = raw.strip().strip('"').strip()
-        if raw and raw.upper() != "UNKNOWN" and len(raw.split()) <= 6:
-            return raw
-    return None
-
-
-def build_assistant_name(company_name: str | None) -> str:
-    return f"{company_name} HR Assistant" if company_name else DEFAULT_ASSISTANT_NAME
+def build_assistant_name(company_name: str | None = None) -> str:
+    return DEFAULT_ASSISTANT_NAME
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1114,8 +1083,7 @@ class RagEngine:
         self._log(f"Section distribution: {dict(section_counts)}")
         self.available_sections = sorted(section_counts.keys())
 
-        company_name = guess_company_name(chunks)
-        self.assistant_name = build_assistant_name(company_name)
+        self.assistant_name = build_assistant_name()
         self._log(f"Assistant persona: {self.assistant_name}")
 
         self._log("Loading embedding model...")
@@ -1139,84 +1107,36 @@ class RagEngine:
 
     def answer(self, query: str, session: "SessionState") -> str:
         query = query.strip()
-        intent = route_query(query)
 
-        if intent == "greeting":
+        understanding = route_rewrite_expand_and_classify(
+            query, self.available_sections, session.build_history_text()
+        )
+
+        if understanding["intent"] == "greeting":
             answer = answer_greeting(query)
             session.save_turn(query, answer)
             return answer
 
-        understanding = rewrite_expand_and_classify(
-            query, self.available_sections, session.build_history_text()
-        )
         standalone_query = understanding["standalone_question"]
         paraphrases = understanding["paraphrases"]
-        target_section = understanding["section"]
-        section_scope = understanding["scope"]
+        section_hint = understanding["section"]
         all_queries = [standalone_query] + paraphrases
 
         context = ""
-        section_contexts: list[str] = []
-
-        if target_section and section_scope in ("broad", "aggregate"):
-            section_contexts = batch_section_contexts(target_section, self.chunks)
-
-            if target_section == session.last_section_asked and is_more_followup(query):
-                label = "details" if section_scope == "broad" else "entitlements"
-                answer = (
-                    f"Those are all the {target_section.lower()} {label} I have — "
-                    f"I don't have anything else listed in the company policy "
-                    f"documents beyond what I already mentioned."
-                )
-                session.save_turn(query, answer)
-                return answer
-
-            session.last_section_asked = target_section
-
-        elif target_section and section_scope == "narrow":
-            session.last_section_asked = None
-            section_index = self.section_indexes.get(target_section)
-            candidates = (
-                multi_query_retrieve(
-                    all_queries, section_index["chunks"], section_index["bm25"],
-                    self.embed_model, section_index["matrix"], section_hint=None
-                ) if section_index else []
+        candidates = multi_query_retrieve(
+            all_queries, self.chunks, self.bm25, self.embed_model,
+            self.embedding_matrix, section_hint
+        )
+        if candidates and candidates[0]["score"] >= THRESHOLD:
+            top = rerank(standalone_query, candidates, self.reranker)
+            context = "\n\n".join(
+                f"[Chunk {i} — Section: {r['chunk'].get('section')}]\n{r['chunk']['text']}"
+                for i, r in enumerate(top, start=1)
             )
-            if candidates and candidates[0]["score"] >= THRESHOLD:
-                top = rerank(standalone_query, candidates, self.reranker)
-                context = "\n\n".join(
-                    f"[Chunk {i} — Section: {r['chunk'].get('section')}]\n{r['chunk']['text']}"
-                    for i, r in enumerate(top, start=1)
-                )
 
-        else:
-            session.last_section_asked = None
-            section_hint = soft_section_hint(standalone_query, self.available_sections)
+        answer = answer_as_assistant(context, standalone_query, self.assistant_name)
 
-            candidates = multi_query_retrieve(
-                all_queries, self.chunks, self.bm25, self.embed_model,
-                self.embedding_matrix, section_hint
-            )
-            if candidates and candidates[0]["score"] >= THRESHOLD:
-                top = rerank(standalone_query, candidates, self.reranker)
-                context = "\n\n".join(
-                    f"[Chunk {i} — Section: {r['chunk'].get('section')}]\n{r['chunk']['text']}"
-                    for i, r in enumerate(top, start=1)
-                )
-
-        if target_section and section_scope == "broad":
-            answer = answer_section_as_assistant(
-                target_section, section_contexts, standalone_query, self.assistant_name
-            )
-        elif target_section and section_scope == "aggregate":
-            answer = answer_section_aggregate(
-                target_section, section_contexts, standalone_query, self.assistant_name
-            )
-        else:
-            answer = answer_as_assistant(context, standalone_query, self.assistant_name)
-
-        used_section_dump = target_section and section_scope in ("broad", "aggregate")
-        if not used_section_dump and context:
+        if context:
             answer = verify_answer(context, answer, question=standalone_query)
 
         session.save_turn(query, answer)
