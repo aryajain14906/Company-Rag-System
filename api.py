@@ -118,26 +118,213 @@ _CHAT_PAGE = """
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Company Policy Assistant</title>
 <style>
-  body { font-family: -apple-system, Arial, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
-  #log { border: 1px solid #ddd; border-radius: 8px; padding: 16px; height: 420px; overflow-y: auto; margin-bottom: 12px; }
-  .msg { margin-bottom: 14px; line-height: 1.4; }
-  .user { font-weight: 600; }
-  .bot { color: #222; white-space: pre-wrap; }
-  form { display: flex; gap: 8px; }
-  input { flex: 1; padding: 10px; font-size: 15px; border: 1px solid #ccc; border-radius: 6px; }
-  button { padding: 10px 18px; font-size: 15px; border: none; border-radius: 6px; background: #111; color: #fff; cursor: pointer; }
-  button:disabled { opacity: 0.5; cursor: default; }
+  @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap');
+
+  :root {
+    --ink: #1c2430;
+    --paper: #f6f3ec;
+    --paper-raised: #ffffff;
+    --line: #ddd6c7;
+    --stamp: #8a2e2e;
+    --stamp-dim: #8a2e2e22;
+    --muted: #6b6558;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', -apple-system, sans-serif;
+    background: var(--paper);
+    color: var(--ink);
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+
+  .card {
+    width: 100%;
+    max-width: 640px;
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    box-shadow: 0 1px 3px rgba(28,36,48,0.06);
+    overflow: hidden;
+  }
+
+  header {
+    padding: 28px 28px 20px;
+    border-bottom: 1px solid var(--line);
+    position: relative;
+  }
+
+  header::after {
+    content: "";
+    position: absolute;
+    top: 24px;
+    right: 28px;
+    width: 34px;
+    height: 34px;
+    border: 2px solid var(--stamp);
+    border-radius: 50%;
+    opacity: 0.35;
+  }
+
+  h1 {
+    font-family: 'Fraunces', serif;
+    font-size: 22px;
+    font-weight: 600;
+    margin: 0 0 4px;
+    letter-spacing: -0.01em;
+  }
+
+  .subtitle {
+    font-size: 13px;
+    color: var(--muted);
+    margin: 0;
+  }
+
+  #log {
+    height: 440px;
+    overflow-y: auto;
+    padding: 20px 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  #log::-webkit-scrollbar { width: 6px; }
+  #log::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+
+  .msg {
+    max-width: 82%;
+    padding: 11px 15px;
+    border-radius: 10px;
+    font-size: 14.5px;
+    line-height: 1.5;
+    animation: rise 0.28s ease;
+    white-space: pre-wrap;
+  }
+
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .user {
+    align-self: flex-end;
+    background: var(--ink);
+    color: var(--paper);
+    border-bottom-right-radius: 3px;
+  }
+
+  .bot {
+    align-self: flex-start;
+    background: #efeade;
+    color: var(--ink);
+    border-bottom-left-radius: 3px;
+    border-left: 2px solid var(--stamp-dim);
+  }
+
+  .bot.error {
+    border-left-color: var(--stamp);
+    color: #6e2323;
+  }
+
+  .typing {
+    align-self: flex-start;
+    display: flex;
+    gap: 4px;
+    padding: 13px 16px;
+  }
+
+  .typing span {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--muted);
+    animation: bounce 1.1s infinite;
+  }
+
+  .typing span:nth-child(2) { animation-delay: 0.15s; }
+  .typing span:nth-child(3) { animation-delay: 0.3s; }
+
+  @keyframes bounce {
+    0%, 60%, 100% { transform: translateY(0); opacity: 0.5; }
+    30% { transform: translateY(-4px); opacity: 1; }
+  }
+
+  form {
+    display: flex;
+    gap: 10px;
+    padding: 18px 28px 24px;
+    border-top: 1px solid var(--line);
+  }
+
+  input {
+    flex: 1;
+    padding: 12px 14px;
+    font-size: 14.5px;
+    font-family: inherit;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--paper);
+    color: var(--ink);
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  input:focus {
+    border-color: var(--stamp);
+  }
+
+  button {
+    padding: 0 20px;
+    font-size: 14px;
+    font-weight: 500;
+    font-family: inherit;
+    border: none;
+    border-radius: 6px;
+    background: var(--stamp);
+    color: #fff;
+    cursor: pointer;
+    transition: opacity 0.15s, transform 0.1s;
+  }
+
+  button:hover:not(:disabled) { opacity: 0.9; }
+  button:active:not(:disabled) { transform: scale(0.97); }
+  button:disabled { opacity: 0.4; cursor: default; }
+
+  .empty {
+    align-self: center;
+    margin: auto;
+    text-align: center;
+    color: var(--muted);
+    font-size: 13.5px;
+    max-width: 260px;
+    line-height: 1.6;
+  }
 </style>
 </head>
 <body>
-  <h2>Company Policy Assistant</h2>
-  <div id="log"></div>
-  <form id="form">
-    <input id="input" autocomplete="off" placeholder="Ask about leave, benefits, conduct..." />
-    <button id="send">Send</button>
-  </form>
+  <div class="card">
+    <header>
+      <h1>Company Policy Assistant</h1>
+      <p class="subtitle">Answers sourced from your company's policy documents.</p>
+    </header>
+    <div id="log">
+      <div class="empty" id="empty-state">Ask about leave, benefits, conduct, or any company policy — I'll answer strictly from the documents on file.</div>
+    </div>
+    <form id="form">
+      <input id="input" autocomplete="off" placeholder="Ask a question..." />
+      <button id="send">Send</button>
+    </form>
+  </div>
 
 <script>
 const sessionId = crypto.randomUUID();
@@ -145,13 +332,25 @@ const log = document.getElementById("log");
 const form = document.getElementById("form");
 const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
+const emptyState = document.getElementById("empty-state");
 
 function addMessage(text, cls) {
+  if (emptyState) emptyState.remove();
   const div = document.createElement("div");
-  div.className = "msg";
-  div.innerHTML = `<div class="${cls}">${text}</div>`;
+  div.className = "msg " + cls;
+  div.textContent = text;
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
+  return div;
+}
+
+function addTyping() {
+  const div = document.createElement("div");
+  div.className = "typing";
+  div.innerHTML = "<span></span><span></span><span></span>";
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  return div;
 }
 
 form.addEventListener("submit", async (e) => {
@@ -164,6 +363,8 @@ form.addEventListener("submit", async (e) => {
   input.disabled = true;
   sendBtn.disabled = true;
 
+  const typingEl = addTyping();
+
   try {
     const res = await fetch("/ask", {
       method: "POST",
@@ -171,9 +372,15 @@ form.addEventListener("submit", async (e) => {
       body: JSON.stringify({ question, session_id: sessionId })
     });
     const data = await res.json();
-    addMessage(res.ok ? data.answer : ("Error: " + (data.detail || "something went wrong")), "bot");
+    typingEl.remove();
+    if (res.ok) {
+      addMessage(data.answer, "bot");
+    } else {
+      addMessage(data.detail || "Something went wrong.", "bot error");
+    }
   } catch (err) {
-    addMessage("Error: could not reach the server.", "bot");
+    typingEl.remove();
+    addMessage("Could not reach the server. Please try again.", "bot error");
   } finally {
     input.disabled = false;
     sendBtn.disabled = false;
