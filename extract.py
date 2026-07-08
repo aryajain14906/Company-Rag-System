@@ -22,6 +22,15 @@ so it can be used by a web server with multiple concurrent users:
 LLM BACKEND: OpenRouter instead of local Ollama, so this doesn't
 require every laptop to run its own model server. Only the server
 process needs OPENROUTER_API_KEY set — clients just hit the HTTP API.
+
+PDF PARSING: pdfplumber instead of unstructured.partition_pdf. This
+drops the entire onnxruntime / opencv / spacy / timm / transformers
+layout-detection dependency chain that unstructured pulls in, which was
+the main cause of out-of-memory crashes on Render's 512MB free tier.
+Since policy PDFs here are plain single-column text (no scans, no
+complex layouts), pdfplumber gives equivalent results at a fraction of
+the memory. See extract_elements() below for details on the title
+detection heuristic that replaces unstructured's ML layout model.
 """
 
 import os
@@ -30,15 +39,16 @@ import json
 import glob
 import pickle
 import hashlib
+import statistics
 from dataclasses import dataclass, field
 from collections import Counter
 
 import numpy as np
 import requests
+import pdfplumber
 
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer, CrossEncoder, util
-from unstructured.partition.pdf import partition_pdf
 
 # ─────────────────────────────────────────────────────────────
 # CONFIG
@@ -80,7 +90,8 @@ MAX_SUBQUERIES    = 2
 SOFT_SECTION_BOOST = 0.15
 DEFAULT_ASSISTANT_NAME = "Company HR Assistant"
 MAX_SECTION_CONTEXT_CHARS = 6000
-CHUNKING_VERSION  = 4
+CHUNKING_VERSION  = 5  # bumped: pdfplumber chunks are not guaranteed
+                       # identical to old unstructured-based cache entries
 
 # ─────────────────────────────────────────────────────────────
 # OPENROUTER REST CLIENT
@@ -163,8 +174,88 @@ def find_policy_pdfs(folder_path: str) -> list[str]:
     return unique
 
 
-def extract_elements(pdf_path: str) -> list:
-    return [el for el in partition_pdf(filename=pdf_path) if str(el).strip()]
+# ─────────────────────────────────────────────────────────────
+# 1b. PDF ELEMENT EXTRACTION (pdfplumber-based)
+# ─────────────────────────────────────────────────────────────
+
+_SENTENCE_END_RE = re.compile(r'[.,;:]\s*$')
+_MAX_TITLE_WORDS = 12
+
+
+class _Element:
+    """Mimics the small surface area of unstructured's element objects
+    that chunk_file() actually uses: str(el) and el.category."""
+    __slots__ = ("text", "category")
+
+    def __init__(self, text: str, category: str):
+        self.text = text
+        self.category = category
+
+    def __str__(self) -> str:
+        return self.text
+
+
+def _looks_like_title(line: str, median_size: float | None, line_size: float | None) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+
+    word_count = len(stripped.split())
+    if word_count == 0 or word_count > _MAX_TITLE_WORDS:
+        return False
+
+    if _SENTENCE_END_RE.search(stripped):
+        return False
+
+    is_all_caps = stripped.upper() == stripped and any(c.isalpha() for c in stripped)
+    is_title_case = stripped.istitle()
+    is_larger_font = (
+        median_size is not None and line_size is not None
+        and line_size > median_size * 1.15
+    )
+
+    return is_all_caps or is_title_case or is_larger_font
+
+
+def extract_elements(pdf_path: str) -> list[_Element]:
+    """
+    Extracts text lines from a PDF, tagging each as "Title" or "Text".
+
+    Replaces unstructured.partition_pdf's ML layout model with a
+    heuristic (short line, no sentence punctuation, ALL CAPS / Title
+    Case / larger-than-median font size). This is a heuristic, not a
+    guarantee — fine for the plain single-column text policy PDFs this
+    app is built for. `subsection` (derived from Title lines) is stored
+    on each chunk but isn't read anywhere else in retrieval/answering,
+    so any occasional misfire here is cosmetic only.
+    """
+    elements: list[_Element] = []
+
+    with pdfplumber.open(pdf_path) as pdf:
+        all_sizes = []
+        for page in pdf.pages:
+            for ch in page.chars:
+                size = ch.get("size")
+                if size:
+                    all_sizes.append(size)
+        median_size = statistics.median(all_sizes) if all_sizes else None
+
+        for page in pdf.pages:
+            lines = page.extract_text_lines(layout=False) or []
+
+            for line in lines:
+                text = line.get("text", "").strip()
+                if not text:
+                    continue
+
+                chars = line.get("chars", [])
+                sizes = [c["size"] for c in chars if c.get("size")]
+                line_size = (sum(sizes) / len(sizes)) if sizes else None
+
+                category = "Title" if _looks_like_title(text, median_size, line_size) else "Text"
+                elements.append(_Element(text, category))
+
+    return [el for el in elements if str(el).strip()]
 
 
 # ─────────────────────────────────────────────────────────────

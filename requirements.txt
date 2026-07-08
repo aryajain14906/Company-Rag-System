@@ -6,4 +6,4 @@ requests
 numpy
 rank_bm25
 sentence-transformers
-unstructured[pdf]
+pdfplumber

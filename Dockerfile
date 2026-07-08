@@ -1,12 +1,5 @@
 FROM python:3.11-slim
 
-# System dependencies unstructured[pdf] needs for PDF parsing/OCR
-RUN apt-get update && apt-get install -y \
-    poppler-utils \
-    tesseract-ocr \
-    libgl1 \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
 COPY requirements.txt .
