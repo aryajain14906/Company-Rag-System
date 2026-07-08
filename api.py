@@ -28,6 +28,35 @@ Sessions are kept in memory only (a plain dict). Restarting the server
 wipes all conversation history — fine for a small internal tool, not
 fine if you need durability; swap SESSIONS for a real store (Redis,
 a database) if that ever matters.
+
+STARTUP
+-------
+The FastAPI app object is created — and uvicorn binds $PORT — BEFORE
+the RagEngine (PDF parsing, model downloads, embedding all chunks) is
+built. That heavy work happens in a background thread kicked off by
+the "startup" event instead. This matters on platforms like Render
+that scan for an open port shortly after the container starts: if the
+engine load blocked the app/uvicorn from existing yet, the port scan
+would time out and fail the deploy even though the app would have come
+up fine a few seconds later. Requests to /ask return a 503 with a
+clear message until the engine finishes loading.
+
+HEALTH CHECK (/health)
+-----------------------
+Set this as the "Health Check Path" in Render's service settings.
+Render uses it to decide when a newly-deployed instance is ready to
+receive real traffic — until /health returns 200, Render keeps routing
+users to the OLD (still-running) instance instead. This means normal
+deploys are zero-downtime: users never see a 503 or a slow response
+just because a new version is loading in the background.
+
+This does NOT help the very first deploy, or a cold start after a
+free-tier instance spins down from inactivity — in both of those
+cases there's no "old instance" to fall back to, so whoever hits the
+service first still waits for (or gets a 503 from) the engine load.
+Fixing that requires making the engine load itself faster (predownload
+models into the Docker image, persist the embeddings cache) or staying
+on a tier that doesn't spin down.
 """
 
 import os
@@ -40,17 +69,19 @@ from pydantic import BaseModel
 
 from extract import RagEngine, SessionState
 
-# ─────────────────────────────────────────────────────────────
-# ONE-TIME SETUP (happens once, when the server process starts —
-# NOT per request. Parsing PDFs / embedding / loading models per
-# request would make every single question take minutes.)
-# ─────────────────────────────────────────────────────────────
-
 POLICY_FOLDER = os.getenv("POLICY_FOLDER", "./policies")
 
-print(f"Starting up — loading policy documents from '{POLICY_FOLDER}'...")
-engine = RagEngine(POLICY_FOLDER, verbose=False)
-print("Engine ready.")
+# ─────────────────────────────────────────────────────────────
+# APP — created immediately so uvicorn can bind $PORT right away.
+# The heavy RagEngine load happens in a background thread after
+# startup, not before.
+# ─────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Company Policy Assistant")
+
+_engine_lock = threading.Lock()
+engine: RagEngine | None = None
+engine_error: str | None = None
 
 # session_id -> SessionState. Plain dict + a lock since FastAPI can
 # handle requests concurrently (e.g. via threadpool for sync code) and
@@ -59,18 +90,30 @@ SESSIONS: dict[str, SessionState] = {}
 _sessions_lock = threading.Lock()
 
 
+def _load_engine() -> None:
+    global engine, engine_error
+    try:
+        print(f"Loading policy documents from '{POLICY_FOLDER}'...")
+        e = RagEngine(POLICY_FOLDER, verbose=False)
+        with _engine_lock:
+            engine = e
+        print("Engine ready.")
+    except Exception as exc:
+        with _engine_lock:
+            engine_error = str(exc)
+        print(f"Engine failed to load: {exc}")
+
+
+@app.on_event("startup")
+def start_background_load() -> None:
+    threading.Thread(target=_load_engine, daemon=True).start()
+
+
 def get_session(session_id: str) -> SessionState:
     with _sessions_lock:
         if session_id not in SESSIONS:
             SESSIONS[session_id] = SessionState()
         return SESSIONS[session_id]
-
-
-# ─────────────────────────────────────────────────────────────
-# APP
-# ─────────────────────────────────────────────────────────────
-
-app = FastAPI(title="Company Policy Assistant")
 
 
 class AskRequest(BaseModel):
@@ -83,8 +126,28 @@ class AskResponse(BaseModel):
     session_id: str
 
 
+@app.get("/health")
+def health():
+    """
+    Set as Render's "Health Check Path". Render keeps routing users to
+    the old instance during a deploy until this returns 200, so no one
+    hits a half-loaded new instance.
+    """
+    if engine is None:
+        raise HTTPException(status_code=503, detail=engine_error or "loading")
+    return {"status": "ok"}
+
+
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
+    if engine is None:
+        detail = (
+            "Still starting up, please retry in a moment."
+            if not engine_error
+            else f"Engine failed to initialize: {engine_error}"
+        )
+        raise HTTPException(status_code=503, detail=detail)
+
     question = req.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="question must not be empty")
@@ -105,6 +168,7 @@ def ask(req: AskRequest):
 
 
 @app.get("/", response_class=HTMLResponse)
+@app.head("/")
 def home():
     return _CHAT_PAGE
 
