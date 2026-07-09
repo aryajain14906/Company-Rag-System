@@ -114,7 +114,7 @@ if non_free:
 MAX_CHARS         = 400
 OVERLAP_ELEMENTS  = 2
 TOP_K_RETRIEVAL   = 10
-TOP_K_FINAL       = 5
+TOP_K_FINAL       = 10
 THRESHOLD         = 0.1
 DENSE_ONLY_FLOOR  = 0.55
 MAX_HISTORY       = 5
@@ -395,12 +395,23 @@ def build_all_chunks(folder_path: str) -> list[dict]:
 # ─────────────────────────────────────────────────────────────
 
 def _folder_signature(folder_path: str) -> str:
+    # Content-based, NOT mtime-based. A git checkout (which is what
+    # happens on every fresh Docker build/deploy) always produces a new
+    # file modification time, even when the file's bytes are completely
+    # unchanged — so a signature that includes mtime can NEVER match a
+    # previous deploy's cache, meaning we'd re-embed every single chunk
+    # on every single deploy forever, regardless of any disk persistence.
+    # Hashing actual file content means the signature only changes when
+    # a PDF's content genuinely changes, so a persisted cache (e.g. via
+    # a Render persistent disk, or by committing the cache file to the
+    # repo) can actually be reused across deploys.
     pdf_paths = find_policy_pdfs(folder_path)
-    parts = []
-    for p in pdf_paths:
-        stat = os.stat(p)
-        parts.append(f"{os.path.basename(p)}:{stat.st_mtime_ns}:{stat.st_size}")
-    return hashlib.sha256("|".join(sorted(parts)).encode()).hexdigest()
+    hasher = hashlib.sha256()
+    for p in sorted(pdf_paths):
+        hasher.update(os.path.basename(p).encode())
+        with open(p, "rb") as f:
+            hasher.update(f.read())
+    return hasher.hexdigest()
 
 
 def load_or_create_embeddings(chunks: list[dict],
@@ -804,6 +815,76 @@ def is_more_followup(query: str) -> bool:
     return bool(_MORE_FOLLOWUP_RE.search(query.strip()))
 
 
+# ─────────────────────────────────────────────────────────────
+# 7b. FORMAT DIRECTIVE DETECTION (word/line limits, verbosity)
+# ─────────────────────────────────────────────────────────────
+# Detected with regex rather than left to the LLM to "remember" through
+# the rewrite step — the model was inconsistently honoring things like
+# "answer in 1 line" (sometimes ignoring it, sometimes misfiring its own
+# self-check and returning an unrelated fallback message instead).
+
+_FORMAT_DIRECTIVE_RE = re.compile(
+    r'\b('
+    r'in\s+\d+\s+(?:lines?|words?|sentences?|bullets?|points?)'
+    r'|in\s+(?:one|two|three|four|five|six)\s+(?:lines?|words?|sentences?|bullets?|points?)'
+    r'|in\s+detail'
+    r'|in\s+brief'
+    r'|briefly'
+    r'|concisely'
+    r'|short(?:er)?'
+    r'|long(?:er)?'
+    r'|one[-\s]liner'
+    r'|single\s+line'
+    r')\b',
+    re.IGNORECASE
+)
+
+
+def extract_format_directive(query: str) -> str | None:
+    match = _FORMAT_DIRECTIVE_RE.search(query)
+    return match.group(0).strip() if match else None
+
+
+# A message that is ONLY a formatting request with no new topic content
+# — e.g. "answer in 1 line", "answer in detail instead", "briefly" — as
+# opposed to a fresh question that happens to also specify a format.
+_REFORMAT_ONLY_RE = re.compile(
+    r'^\s*(?:answer|reply|respond|say\s+that|write\s+that)?\s*'
+    r'(?:in\s+\d+\s+(?:lines?|words?|sentences?|bullets?|points?)'
+    r'|in\s+(?:one|two|three|four|five|six)\s+(?:lines?|words?|sentences?|bullets?|points?)'
+    r'|in\s+detail|in\s+brief|briefly|concisely|short(?:er)?|long(?:er)?'
+    r'|one[-\s]liner|single\s+line)'
+    r'\s*(?:instead|please|pls)?\s*[.!\']?\s*$',
+    re.IGNORECASE
+)
+
+
+def is_reformat_only(query: str) -> bool:
+    return bool(_REFORMAT_ONLY_RE.match(query.strip()))
+
+
+# ─────────────────────────────────────────────────────────────
+# 7c. BROAD CATEGORY QUESTION DETECTION
+# ─────────────────────────────────────────────────────────────
+# "How many leaves do I get" / "What are the HR policies" ask for an
+# ENTIRE category, not one fact. Top-k chunk retrieval tends to surface
+# whichever single sub-topic scores highest (e.g. only bereavement
+# leave) or, worse, mostly document-title chunks with little real
+# content (as happened with "what are the HR policies"). When we're
+# confident about which section the question belongs to, pulling the
+# COMPLETE section as context avoids both failure modes.
+
+_BROAD_CATEGORY_RE = re.compile(
+    r'\b(what are|what is|list|all|every|overview|summary|summarize)\b'
+    r'.{0,30}\b(polic(?:y|ies)|benefits?|leaves?|rules?|entitlements?)\b',
+    re.IGNORECASE
+)
+
+
+def is_broad_category_question(query: str) -> bool:
+    return bool(_BROAD_CATEGORY_RE.search(query))
+
+
 @dataclass
 class SessionState:
     """
@@ -903,6 +984,12 @@ SELF-CHECK BEFORE ANSWERING (do this silently, do not show your work):
 - If the context doesn't actually address the question, discard your
   draft and answer exactly:
   "I don't have that information in the company policy documents."
+- IMPORTANT: a request about LENGTH or FORMAT ("in 1 line", "briefly",
+  "in detail", etc.) is NOT an opinion and NOT a sign the context is
+  irrelevant. Never let a formatting instruction by itself trigger
+  either fallback message above — those only apply to actual missing
+  facts or actual opinions/recommendations.
+{format_block}
 - Only after this check passes, output the final answer. Output ONLY
   the final answer text — no preamble, no notes about your check.
 
@@ -914,11 +1001,22 @@ def answer_greeting(query: str) -> str:
     return ask_llm(GREETING_PROMPT.format(query=query))
 
 
-def answer_as_assistant(context: str, rewritten_query: str, assistant_name: str) -> str:
+def answer_as_assistant(context: str, rewritten_query: str, assistant_name: str,
+                         format_directive: str | None = None) -> str:
+    format_block = (
+        f"- FORMAT REQUIREMENT: the user wants the answer \"{format_directive}\". "
+        f"Apply this to your final answer's length/structure, AFTER you have "
+        f"already drafted a fully correct, grounded answer. Trim to fit this "
+        f"format while keeping the most important facts — never invent facts "
+        f"to fill space, and never let this requirement alone cause you to "
+        f"output a fallback message."
+        if format_directive else ""
+    )
     prompt = PERSONA_PROMPT.format(
         context=context if context.strip() else "(no policy context retrieved)",
         rewritten_query=rewritten_query,
-        assistant_name=assistant_name
+        assistant_name=assistant_name,
+        format_block=format_block
     )
     return ask_llm(prompt)
 
@@ -1028,8 +1126,12 @@ Instructions:
 - If the question specifies a qualifying detail, use the matching
   variant for that entitlement but still name every other type in full.
 - Use ONLY facts literally written in the text.
+- Only name actual entitlements/benefits/rules — never treat a document
+  title, section header, or policy manual NAME as if it were itself an
+  entitlement. Skip headers/titles entirely; they are not answers.
 - State facts only — never an opinion or recommendation.
 - Never break character.
+{format_block}
 
 Answer:
 """
@@ -1052,18 +1154,26 @@ Question:
 Combine into ONE final, CONCISE answer covering every distinct
 entitlement type (mention duplicates once). No procedural detail unless
 asked. Never invent new figures — prefer source text if partials
-disagree. Never break character.
+disagree. Never treat a document title/header/policy manual name as an
+entitlement — skip those. Never break character.
+{format_block}
 
 Final Answer:
 """
 
 
 def answer_section_aggregate(section_label: str, contexts: list[str], query: str,
-                              assistant_name: str) -> str:
+                              assistant_name: str, format_directive: str | None = None) -> str:
+    format_block = (
+        f"- FORMAT REQUIREMENT: the user wants the answer \"{format_directive}\". "
+        f"Apply this to your final answer's length/structure without dropping "
+        f"entitlement types where possible; trim procedural detail first."
+        if format_directive else ""
+    )
     if len(contexts) == 1:
         prompt = SECTION_AGGREGATE_PROMPT.format(
             section=section_label, context=contexts[0], query=query,
-            assistant_name=assistant_name
+            assistant_name=assistant_name, format_block=format_block
         )
         return ask_llm(prompt)
 
@@ -1071,7 +1181,7 @@ def answer_section_aggregate(section_label: str, contexts: list[str], query: str
     for ctx in contexts:
         prompt = SECTION_AGGREGATE_PROMPT.format(
             section=section_label, context=ctx, query=query,
-            assistant_name=assistant_name
+            assistant_name=assistant_name, format_block=""
         )
         partial_answers.append(ask_llm(prompt))
 
@@ -1087,7 +1197,8 @@ def answer_section_aggregate(section_label: str, contexts: list[str], query: str
         partial_answers=joined_partials,
         source_parts=joined_sources,
         query=query,
-        assistant_name=assistant_name
+        assistant_name=assistant_name,
+        format_block=format_block
     )
     return ask_llm(synthesis_prompt)
 
@@ -1133,6 +1244,52 @@ Corrected Answer:
 def verify_answer(context: str, answer: str, question: str = "") -> str:
     prompt = VERIFY_PROMPT.format(context=context, answer=answer, question=question)
     return ask_llm(prompt).strip()
+
+
+# ─────────────────────────────────────────────────────────────
+# 10b. REFORMAT-ONLY FOLLOW-UPS
+# ─────────────────────────────────────────────────────────────
+# For a message that's ONLY a formatting request ("answer in 1 line",
+# "briefly", "in detail") with no new topic content, re-routing through
+# rewrite+retrieval is unreliable — there's no real topic in the message
+# itself to retrieve against, which is exactly what was causing these to
+# come back with an unrelated fallback message. Since the previous
+# answer is already correct and grounded, cheaper and more reliable to
+# just reformat THAT directly — one LLM call, no retrieval needed.
+
+REFORMAT_PROMPT = """
+You are {assistant_name}, a first-person AI assistant for company policy
+questions.
+
+Here is an answer you already gave, which is fully correct and grounded
+in the policy documents:
+
+{previous_answer}
+
+The user now wants the SAME information reformatted like this:
+{format_directive}
+
+Rules:
+- Do NOT add, remove, or change any fact, number, or name from the
+  original answer above.
+- Only change the LENGTH/FORMAT/STRUCTURE as requested.
+- If the requested format cannot fit every fact, keep the most
+  important facts and omit minor procedural detail — but never invent
+  anything new.
+- Keep first-person assistant language.
+- Output ONLY the reformatted answer. No preamble, no meta-commentary.
+
+Reformatted Answer:
+"""
+
+
+def reformat_answer(previous_answer: str, format_directive: str, assistant_name: str) -> str:
+    prompt = REFORMAT_PROMPT.format(
+        assistant_name=assistant_name,
+        previous_answer=previous_answer,
+        format_directive=format_directive
+    )
+    return ask_llm(prompt)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1196,6 +1353,21 @@ class RagEngine:
 
     def answer(self, query: str, session: "SessionState") -> str:
         query = query.strip()
+        format_directive = extract_format_directive(query)
+
+        # Pure formatting follow-up ("answer in 1 line") — reuse the
+        # previous answer directly rather than re-routing/re-retrieving
+        # against a message that has no real topic content of its own.
+        if (
+            is_reformat_only(query)
+            and format_directive
+            and session.conversation_history
+        ):
+            previous_answer = session.conversation_history[-1].get("assistant", "")
+            if previous_answer:
+                answer = reformat_answer(previous_answer, format_directive, self.assistant_name)
+                session.save_turn(query, answer)
+                return answer
 
         understanding = route_rewrite_expand_and_classify(
             query, self.available_sections, session.build_history_text()
@@ -1211,6 +1383,35 @@ class RagEngine:
         section_hint = understanding["section"]
         all_queries = [standalone_query] + paraphrases
 
+        # Safety net: if the LLM's rewrite of a vague follow-up (e.g.
+        # "answer in detail") drifts away from the actual topic, retrieval
+        # using only the rewritten query can come back empty even though
+        # the conversation clearly has a topic. Adding the previous turn's
+        # raw question as one more retrieval query costs a single extra
+        # embed+BM25 lookup (negligible time/memory) and gives retrieval a
+        # second, independent shot at the right topic.
+        if session.conversation_history:
+            prev_user_query = session.conversation_history[-1].get("user", "").strip()
+            if prev_user_query and prev_user_query not in all_queries:
+                all_queries.append(prev_user_query)
+
+        # Broad category question ("what are the HR policies", "how many
+        # leaves do I get") with a confident single-section match: pull
+        # the COMPLETE section instead of top-k chunks. Top-k retrieval on
+        # a broad question tends to surface either just one sub-topic
+        # (e.g. only bereavement leave) or, worse, mostly document-title
+        # chunks with little real content — pulling the whole section
+        # avoids both failure modes at the cost of a couple extra calls,
+        # which is only paid for this specific question shape.
+        if section_hint and is_broad_category_question(standalone_query):
+            contexts = batch_section_contexts(section_hint, self.chunks)
+            answer = answer_section_aggregate(
+                section_hint, contexts, standalone_query, self.assistant_name,
+                format_directive=format_directive
+            )
+            session.save_turn(query, answer)
+            return answer
+
         context = ""
         candidates = multi_query_retrieve(
             all_queries, self.chunks, self.bm25, self.embed_model,
@@ -1223,7 +1424,10 @@ class RagEngine:
                 for i, r in enumerate(top, start=1)
             )
 
-        answer = answer_as_assistant(context, standalone_query, self.assistant_name)
+        answer = answer_as_assistant(
+            context, standalone_query, self.assistant_name,
+            format_directive=format_directive
+        )
 
         session.save_turn(query, answer)
         return answer
