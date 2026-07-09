@@ -387,14 +387,29 @@ def load_or_create_embeddings(chunks: list[dict],
     # slower on CPU than one batched call across all chunks at once (each
     # call has fixed overhead, and batching lets the model vectorize across
     # samples). For a few hundred chunks this can be the difference between
-    # seconds and many minutes — which matters a lot on a free-tier CPU
-    # instance with a limited deploy/health-check window.
-    print(f"[embeddings] No valid cache — encoding {len(chunks)} chunks in a single batch...")
+    # seconds and many minutes.
+    #
+    # BUT: a larger batch_size also means more sequences processed (and
+    # padded to the same length) simultaneously, which spikes peak memory.
+    # Render's free tier caps a container at 512MB total RAM, shared with
+    # the embedding model + reranker already loaded in memory — a batch
+    # size of 64 was enough to push it over that limit and crash the whole
+    # process with an OOM kill (no Python exception, no traceback — the
+    # container is just killed by the platform).
+    #
+    # EMBED_BATCH_SIZE lets you tune this without another code change:
+    # lower it further (e.g. 4) if you still see "Out of memory", raise it
+    # (e.g. 32-64) if you move to a plan with more RAM and want more speed.
+    batch_size = int(os.getenv("EMBED_BATCH_SIZE", "8"))
+    print(
+        f"[embeddings] No valid cache — encoding {len(chunks)} chunks "
+        f"(batch_size={batch_size})..."
+    )
     texts = [chunk["text"] for chunk in chunks]
     embeddings = embed_model.encode(
         texts,
         convert_to_tensor=False,
-        batch_size=64,
+        batch_size=batch_size,
         show_progress_bar=True,
     )
     for chunk, emb in zip(chunks, embeddings):
