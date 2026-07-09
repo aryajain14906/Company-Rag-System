@@ -114,7 +114,7 @@ if non_free:
 MAX_CHARS         = 400
 OVERLAP_ELEMENTS  = 2
 TOP_K_RETRIEVAL   = 10
-TOP_K_FINAL       = 10
+TOP_K_FINAL       = 5
 THRESHOLD         = 0.1
 DENSE_ONLY_FLOOR  = 0.55
 MAX_HISTORY       = 5
@@ -1210,18 +1210,6 @@ class RagEngine:
         paraphrases = understanding["paraphrases"]
         section_hint = understanding["section"]
         all_queries = [standalone_query] + paraphrases
-
-        # Safety net: if the LLM's rewrite of a vague follow-up (e.g.
-        # "answer in detail") drifts away from the actual topic, retrieval
-        # using only the rewritten query can come back empty even though
-        # the conversation clearly has a topic. Adding the previous turn's
-        # raw question as one more retrieval query costs a single extra
-        # embed+BM25 lookup (negligible time/memory) and gives retrieval a
-        # second, independent shot at the right topic.
-        if session.conversation_history:
-            prev_user_query = session.conversation_history[-1].get("user", "").strip()
-            if prev_user_query and prev_user_query not in all_queries:
-                all_queries.append(prev_user_query)
 
         context = ""
         candidates = multi_query_retrieve(
