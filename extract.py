@@ -65,7 +65,7 @@ RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 # OPENROUTER_MODEL can never silently start billing you. If you want a
 # paid model, you must set OPENROUTER_MODEL explicitly yourself — that
 # is an intentional choice, not an accident.
-LLM_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen3-next-80b-a3b-instruct:free")
+LLM_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
 
 if not os.getenv("OPENROUTER_MODEL"):
     print(
