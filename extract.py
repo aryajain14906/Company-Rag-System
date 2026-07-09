@@ -379,10 +379,28 @@ def load_or_create_embeddings(chunks: list[dict],
             and cached.get("chunks") is not None
         )
         if valid:
+            print(f"[embeddings] Cache hit — reusing {len(cached['chunks'])} cached embeddings.")
             return cached["chunks"]
 
-    for chunk in chunks:
-        chunk["embedding"] = embed_model.encode(chunk["text"], convert_to_tensor=False)
+    # Batched encoding instead of one encode() call per chunk. Calling
+    # embed_model.encode() once per chunk in a Python loop is *dramatically*
+    # slower on CPU than one batched call across all chunks at once (each
+    # call has fixed overhead, and batching lets the model vectorize across
+    # samples). For a few hundred chunks this can be the difference between
+    # seconds and many minutes — which matters a lot on a free-tier CPU
+    # instance with a limited deploy/health-check window.
+    print(f"[embeddings] No valid cache — encoding {len(chunks)} chunks in a single batch...")
+    texts = [chunk["text"] for chunk in chunks]
+    embeddings = embed_model.encode(
+        texts,
+        convert_to_tensor=False,
+        batch_size=64,
+        show_progress_bar=True,
+    )
+    for chunk, emb in zip(chunks, embeddings):
+        chunk["embedding"] = emb
+    print(f"[embeddings] Finished encoding {len(chunks)} chunks.")
+
     with open(cache_path, "wb") as f:
         pickle.dump({
             "version": CHUNKING_VERSION,
@@ -1093,8 +1111,10 @@ class RagEngine:
         self.reranker = CrossEncoder(RERANK_MODEL_NAME)
 
         folder_signature = _folder_signature(folder_path)
+        self._log("Loading or creating chunk embeddings...")
         self.chunks = load_or_create_embeddings(chunks, self.embed_model, cache_path, folder_signature)
 
+        self._log("Building BM25 + section indexes...")
         self.bm25 = build_bm25(self.chunks)
         self.embedding_matrix = build_embedding_matrix(self.chunks)
         self.section_indexes = build_section_indexes(self.chunks)
