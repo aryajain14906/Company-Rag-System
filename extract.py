@@ -101,7 +101,7 @@ CHUNKING_VERSION  = 5  # bumped: pdfplumber chunks are not guaranteed
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
-def ask_llm(prompt: str, _retries: int = 2) -> str:
+def ask_llm(prompt: str, _retries: int = 3) -> str:
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError(
@@ -132,7 +132,7 @@ def ask_llm(prompt: str, _retries: int = 2) -> str:
             last_error = f"429 rate limited (attempt {attempt + 1})"
             print(f"[ask_llm] {last_error} — backing off before retry")
             if attempt < _retries:
-                time.sleep(3 * (attempt + 1))
+                time.sleep(min(5 * (2 ** attempt), 30))  # 5s, 10s, 20s
             continue
 
         response.raise_for_status()
@@ -852,6 +852,21 @@ Never break character. Never claim personal employment status or
 personal leave balances. Never invent factual information not present
 in the context. If asked to disparage the company or the policy, say:
 "I don't have that information in the company policy documents."
+
+SELF-CHECK BEFORE ANSWERING (do this silently, do not show your work):
+- Re-read your answer against the context above, sentence by sentence.
+- If any sentence combines facts from two different [Chunk N] blocks
+  without the context explicitly stating a connection between them,
+  delete or rewrite that sentence so it only uses one chunk's facts.
+- If any sentence states an opinion, rating, or recommendation about
+  the company, delete it and replace the overall answer with:
+  "I can't say — the policy documents don't state an opinion on that."
+- If the context doesn't actually address the question, discard your
+  draft and answer exactly:
+  "I don't have that information in the company policy documents."
+- Only after this check passes, output the final answer. Output ONLY
+  the final answer text — no preamble, no notes about your check.
+
 Answer:
 """
 
@@ -1170,9 +1185,6 @@ class RagEngine:
             )
 
         answer = answer_as_assistant(context, standalone_query, self.assistant_name)
-
-        if context:
-            answer = verify_answer(context, answer, question=standalone_query)
 
         session.save_turn(query, answer)
         return answer
