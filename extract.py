@@ -76,7 +76,14 @@ RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 _DEFAULT_FREE_MODELS = [
     "qwen/qwen3-next-80b-a3b-instruct:free",
     "meta-llama/llama-3.3-70b-instruct:free",
-    "deepseek/deepseek-chat-v3.1:free",
+    # OpenRouter's own auto-router for free models. Unlike a hardcoded
+    # slug (e.g. the DeepSeek one this used to be — DeepSeek currently
+    # has ZERO free models on OpenRouter, which is what caused a 404
+    # "model not found"), this always resolves to whatever free model
+    # is currently live, so it can't go stale as free-tier availability
+    # rotates. Kept last since a specific model is still preferred when
+    # available.
+    "openrouter/free",
 ]
 
 _env_models = os.getenv("OPENROUTER_MODELS", "")
@@ -96,7 +103,7 @@ if not _env_models:
         f"model fallback list: {LLM_MODELS}. Set OPENROUTER_MODELS "
         f"(comma-separated) to customize."
     )
-non_free = [m for m in LLM_MODELS if ":free" not in m]
+non_free = [m for m in LLM_MODELS if ":free" not in m and m != "openrouter/free"]
 if non_free:
     print(
         f"[policy_rag] WARNING: OPENROUTER_MODELS contains non-free "
