@@ -58,25 +58,49 @@ from sentence_transformers import SentenceTransformer, CrossEncoder, util
 EMBED_MODEL_NAME  = "BAAI/bge-small-en-v1.5"
 RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-# OpenRouter model string. Swap for whatever you want to use —
-# see https://openrouter.ai/models for options.
+# OpenRouter model fallback list. Instead of pinning to ONE free model
+# (which fails entirely if that model's current provider is down or
+# rate-limited — as we saw happen with Venice on both Qwen and Llama),
+# this gives OpenRouter a priority-ordered list of free models to try.
+# If the first one's provider is down/rate-limited/refuses, OpenRouter
+# automatically tries the next one in the list — no code-level retry
+# or manual model-switching needed.
 #
-# SAFETY DEFAULT: this defaults to a ":free" model, so forgetting to set
-# OPENROUTER_MODEL can never silently start billing you. If you want a
-# paid model, you must set OPENROUTER_MODEL explicitly yourself — that
-# is an intentional choice, not an accident.
-LLM_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+# Configure via OPENROUTER_MODELS as a comma-separated list, e.g.:
+#   OPENROUTER_MODELS=qwen/qwen3-next-80b-a3b-instruct:free,meta-llama/llama-3.3-70b-instruct:free
+# Falls back to a sensible built-in list of free models if not set.
+#
+# SAFETY DEFAULT: every entry defaults to a ":free" model, so forgetting
+# to set this can never silently start billing you. If you want a paid
+# model anywhere in the list, add it explicitly yourself.
+_DEFAULT_FREE_MODELS = [
+    "qwen/qwen3-next-80b-a3b-instruct:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "deepseek/deepseek-chat-v3.1:free",
+]
 
-if not os.getenv("OPENROUTER_MODEL"):
+_env_models = os.getenv("OPENROUTER_MODELS", "")
+LLM_MODELS = (
+    [m.strip() for m in _env_models.split(",") if m.strip()]
+    if _env_models
+    else _DEFAULT_FREE_MODELS
+)
+
+# Kept for anything that still refers to a single "current model" name
+# (e.g. log messages) — always the first/primary one in the list.
+LLM_MODEL = LLM_MODELS[0]
+
+if not _env_models:
     print(
-        f"[policy_rag] OPENROUTER_MODEL not set — defaulting to free model "
-        f"'{LLM_MODEL}'. Set OPENROUTER_MODEL explicitly if you want a "
-        f"different (possibly paid) model."
+        f"[policy_rag] OPENROUTER_MODELS not set — defaulting to free "
+        f"model fallback list: {LLM_MODELS}. Set OPENROUTER_MODELS "
+        f"(comma-separated) to customize."
     )
-elif ":free" not in LLM_MODEL:
+non_free = [m for m in LLM_MODELS if ":free" not in m]
+if non_free:
     print(
-        f"[policy_rag] WARNING: OPENROUTER_MODEL='{LLM_MODEL}' does NOT "
-        f"look like a free model (no ':free' suffix). This will incur "
+        f"[policy_rag] WARNING: OPENROUTER_MODELS contains non-free "
+        f"entries (no ':free' suffix): {non_free}. These will incur "
         f"OpenRouter charges."
     )
 
@@ -116,8 +140,16 @@ def ask_llm(prompt: str, _retries: int = 3) -> str:
         "X-Title": os.getenv("OPENROUTER_APP_NAME", "Company Policy Assistant"),
     }
     payload = {
-        "model": LLM_MODEL,
+        "models": LLM_MODELS,
         "messages": [{"role": "user", "content": prompt}],
+        # Venice has been consistently returning immediate 429s for every
+        # free model we've tried routed through it (confirmed via
+        # OpenRouter's own Upstream Requests log — different models, same
+        # provider, same instant rejection). Excluding it here so
+        # OpenRouter routes to any other provider serving each model.
+        "provider": {
+            "ignore": ["Venice"]
+        },
     }
 
     last_error = None
@@ -159,9 +191,9 @@ def ask_llm(prompt: str, _retries: int = 3) -> str:
 
     raise RuntimeError(
         f"OpenRouter returned no usable content after {_retries + 1} attempts "
-        f"(model={LLM_MODEL}). Last issue: {last_error}. "
-        f"Try a different OPENROUTER_MODEL — some free models return empty "
-        f"content under load or for strict-JSON prompts."
+        f"across models={LLM_MODELS}. Last issue: {last_error}. "
+        f"All models in the fallback list may be under load — try again "
+        f"shortly, or add more entries to OPENROUTER_MODELS."
     )
 
 
