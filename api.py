@@ -182,29 +182,39 @@ _CHAT_PAGE = """
 <html>
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Company Policy Assistant</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap');
 
   :root {
-    --ink: #1c2430;
-    --paper: #f6f3ec;
-    --paper-raised: #ffffff;
-    --line: #ddd6c7;
-    --stamp: #8a2e2e;
-    --stamp-dim: #8a2e2e22;
-    --muted: #6b6558;
+    --ink: #1a2438;
+    --ink-soft: #333f56;
+    --paper: #f6f1e6;
+    --paper-raised: #fffdf8;
+    --line: #ddd2b8;
+    --seal: #7a2b28;
+    --seal-dim: #7a2b2820;
+    --brass: #93702f;
+    --muted: #6b6152;
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
   }
 
-  * { box-sizing: border-box; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  html, body {
+    height: 100%;
+  }
 
   body {
     font-family: 'Inter', -apple-system, sans-serif;
     background: var(--paper);
+    background-image:
+      radial-gradient(ellipse at top, rgba(147,112,47,0.06), transparent 60%);
     color: var(--ink);
     margin: 0;
-    min-height: 100vh;
+    min-height: 100dvh;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -214,65 +224,109 @@ _CHAT_PAGE = """
   .card {
     width: 100%;
     max-width: 640px;
+    height: min(720px, 88dvh);
     background: var(--paper-raised);
     border: 1px solid var(--line);
-    border-radius: 4px;
-    box-shadow: 0 1px 3px rgba(28,36,48,0.06);
+    border-radius: 10px;
+    box-shadow: 0 1px 2px rgba(26,36,56,0.04), 0 12px 32px -16px rgba(26,36,56,0.18);
     overflow: hidden;
+    display: flex;
+    flex-direction: column;
   }
 
   header {
-    padding: 28px 28px 20px;
+    padding: 22px 26px 18px;
     border-bottom: 1px solid var(--line);
     position: relative;
+    flex-shrink: 0;
+    background:
+      linear-gradient(var(--paper-raised), var(--paper-raised)),
+      repeating-linear-gradient(90deg, transparent, transparent 7px, var(--line) 7px, var(--line) 8px);
+    background-size: 100% 100%, 100% 3px;
+    background-position: 0 0, 0 100%;
+    background-repeat: no-repeat, repeat-x;
   }
 
-  header::after {
+  .eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    color: var(--brass);
+    text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 7px;
+  }
+
+  .eyebrow::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--seal);
+    flex-shrink: 0;
+  }
+
+  .seal {
+    position: absolute;
+    top: 18px;
+    right: 22px;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    border: 1.5px solid var(--seal);
+    opacity: 0.4;
+  }
+
+  .seal::after {
     content: "";
     position: absolute;
-    top: 24px;
-    right: 28px;
-    width: 34px;
-    height: 34px;
-    border: 2px solid var(--stamp);
+    inset: 6px;
     border-radius: 50%;
-    opacity: 0.35;
+    border: 1px solid var(--seal);
   }
 
   h1 {
     font-family: 'Fraunces', serif;
-    font-size: 22px;
+    font-size: 21px;
     font-weight: 600;
     margin: 0 0 4px;
     letter-spacing: -0.01em;
+    line-height: 1.2;
   }
 
   .subtitle {
-    font-size: 13px;
+    font-size: 12.5px;
     color: var(--muted);
     margin: 0;
+    max-width: 78%;
   }
 
   #log {
-    height: 440px;
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
-    padding: 20px 28px;
+    padding: 20px 22px;
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 12px;
+    -webkit-overflow-scrolling: touch;
   }
 
   #log::-webkit-scrollbar { width: 6px; }
   #log::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
 
   .msg {
-    max-width: 82%;
-    padding: 11px 15px;
-    border-radius: 10px;
+    max-width: 84%;
+    padding: 11px 14px;
+    border-radius: 9px;
     font-size: 14.5px;
-    line-height: 1.5;
+    line-height: 1.55;
     animation: rise 0.28s ease;
     white-space: pre-wrap;
+    word-wrap: break-word;
   }
 
   @keyframes rise {
@@ -289,15 +343,17 @@ _CHAT_PAGE = """
 
   .bot {
     align-self: flex-start;
-    background: #efeade;
+    background: #efe8d6;
     color: var(--ink);
     border-bottom-left-radius: 3px;
-    border-left: 2px solid var(--stamp-dim);
+    border-left: 2.5px solid var(--seal-dim);
+    position: relative;
   }
 
   .bot.error {
-    border-left-color: var(--stamp);
+    border-left-color: var(--seal);
     color: #6e2323;
+    background: #f5e9e5;
   }
 
   .typing {
@@ -326,43 +382,55 @@ _CHAT_PAGE = """
   form {
     display: flex;
     gap: 10px;
-    padding: 18px 28px 24px;
+    padding: 14px 22px calc(16px + var(--safe-bottom));
     border-top: 1px solid var(--line);
+    flex-shrink: 0;
+    background: var(--paper-raised);
   }
 
   input {
     flex: 1;
+    min-width: 0;
     padding: 12px 14px;
-    font-size: 14.5px;
+    font-size: 16px;
     font-family: inherit;
     border: 1px solid var(--line);
-    border-radius: 6px;
+    border-radius: 8px;
     background: var(--paper);
     color: var(--ink);
     outline: none;
-    transition: border-color 0.15s;
+    transition: border-color 0.15s, box-shadow 0.15s;
   }
 
   input:focus {
-    border-color: var(--stamp);
+    border-color: var(--seal);
+    box-shadow: 0 0 0 3px var(--seal-dim);
   }
 
   button {
     padding: 0 20px;
     font-size: 14px;
-    font-weight: 500;
+    font-weight: 600;
     font-family: inherit;
     border: none;
-    border-radius: 6px;
-    background: var(--stamp);
+    border-radius: 8px;
+    background: var(--seal);
     color: #fff;
     cursor: pointer;
     transition: opacity 0.15s, transform 0.1s;
+    min-height: 44px;
+    flex-shrink: 0;
   }
 
   button:hover:not(:disabled) { opacity: 0.9; }
   button:active:not(:disabled) { transform: scale(0.97); }
   button:disabled { opacity: 0.4; cursor: default; }
+
+  button:focus-visible,
+  input:focus-visible {
+    outline: 2px solid var(--brass);
+    outline-offset: 2px;
+  }
 
   .empty {
     align-self: center;
@@ -373,13 +441,37 @@ _CHAT_PAGE = """
     max-width: 260px;
     line-height: 1.6;
   }
+
+  @media (prefers-reduced-motion: reduce) {
+    .msg, .typing span { animation: none; }
+  }
+
+  @media (max-width: 640px) {
+    body { padding: 0; align-items: stretch; }
+    .card {
+      height: 100dvh;
+      max-width: none;
+      border-radius: 0;
+      border-left: none;
+      border-right: none;
+    }
+    header { padding: calc(16px + var(--safe-top)) 18px 14px; }
+    .seal { width: 32px; height: 32px; top: calc(14px + var(--safe-top)); right: 16px; }
+    h1 { font-size: 18.5px; }
+    .subtitle { max-width: 100%; font-size: 12px; }
+    #log { padding: 16px 16px; }
+    .msg { max-width: 90%; font-size: 14px; }
+    form { padding: 12px 16px calc(14px + var(--safe-bottom)); }
+  }
 </style>
 </head>
 <body>
   <div class="card">
     <header>
+      <div class="eyebrow">Policy Desk &middot; On File</div>
       <h1>Company Policy Assistant</h1>
-      <p class="subtitle">Answers sourced from your company's policy documents.</p>
+      <p class="subtitle">Answers sourced directly from your company's policy documents.</p>
+      <div class="seal" aria-hidden="true"></div>
     </header>
     <div id="log">
       <div class="empty" id="empty-state">Ask about leave, benefits, conduct, or any company policy — I'll answer strictly from the documents on file.</div>
